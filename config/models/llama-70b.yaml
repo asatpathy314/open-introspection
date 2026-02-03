@@ -1,0 +1,10 @@
+model:
+  name: llama-70b
+  model_id: meta-llama/Llama-3.3-70B-Instruct
+  num_layers: 80
+  hidden_dim: 8192
+  param_count_b: 70.0
+  architecture: llama
+  quantization: int8
+  max_new_tokens: 128  # Reduced for tight memory budget
+  default_layers: [13, 26, 40, 53, 66, 76]

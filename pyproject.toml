@@ -1,7 +1,62 @@
 [project]
 name = "introspection-replication"
 version = "0.1.0"
-description = "Add your description here"
+description = "Replication of Lindsey (2025) introspection experiments on open-source LLMs"
 readme = "README.md"
-requires-python = ">=3.13"
-dependencies = []
+requires-python = ">=3.11"
+dependencies = [
+    # Core ML
+    "torch>=2.4.0",
+    "nnsight>=0.5.0,<0.6.0",
+    "transformers>=4.44.0",
+    "accelerate>=0.34.0",
+    "sentencepiece>=0.2.0",
+    "protobuf>=4.25.0",
+
+    # Quantization (CUDA only at runtime, but installed everywhere)
+    "bitsandbytes>=0.43.0",
+
+    # Data & Config
+    "pyyaml>=6.0",
+    "pandas>=2.1.0",
+
+    # Evaluation (LLM judge)
+    "openai>=1.40.0",
+
+    # Utilities
+    "tqdm>=4.66.0",
+    "psutil>=5.9.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "ruff>=0.5.0",
+    "mypy>=1.10.0",
+]
+analysis = [
+    "matplotlib>=3.8.0",
+    "seaborn>=0.13.0",
+    "jupyter>=1.0.0",
+]
+
+[project.scripts]
+introspect = "introspection.experiments.runner:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/introspection"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

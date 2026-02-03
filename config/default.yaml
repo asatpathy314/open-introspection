@@ -1,0 +1,66 @@
+# Introspection Replication - Default Configuration
+
+# Hardware (auto-detected if not specified)
+hardware:
+  backend: auto          # auto | cuda | mps | cpu
+  dtype: auto            # auto | float16 | bfloat16 | float32
+  max_memory_fraction: 0.85
+
+# Model selection
+model:
+  name: llama-8b         # llama-8b | qwen-32b | llama-70b
+  quantization: auto     # auto | none | int8 | int4
+  max_new_tokens: 256
+
+# Concept vectors
+vectors:
+  extraction_template: "Tell me about {word}."
+  token_position: last   # last | average
+  cache_dir: data/vectors
+  dataset_path: data/concepts/simple_data.json
+  normalize: true
+
+# Injection
+injection:
+  apply_to: all          # all | generated_only
+
+# Experiments
+experiments:
+  seed: 42
+  num_trials: 50
+  temperature: 1.0
+  output_dir: data/results
+
+  self_report:
+    enabled: true
+    layers: auto         # auto = use model's default_layers
+    alphas: [1, 2, 4, 8, 16]
+    criteria: [coherence, affirmative, correct_identification]
+
+  distinguish:
+    enabled: true
+    layers: auto
+    alphas: [4, 9, 16]
+    num_distractors: 9
+
+  prefill_detect:
+    enabled: false
+    layers: auto
+    alphas: [4, 9, 16]
+
+  intentional_control:
+    enabled: false
+    layers: auto
+    alphas: [4, 9, 16]
+
+# Evaluation (LLM judge)
+evaluation:
+  judge_model: gpt-5-nano
+  max_retries: 3
+  retry_delay: 1.0
+  # API key loaded from OPENAI_API_KEY env var
+
+# Logging
+logging:
+  level: INFO
+  file: data/logs/experiment.log

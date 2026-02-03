@@ -1,0 +1,10 @@
+model:
+  name: qwen-32b
+  model_id: Qwen/Qwen2.5-32B-Instruct
+  num_layers: 64
+  hidden_dim: 5120
+  param_count_b: 32.0
+  architecture: qwen
+  quantization: int8
+  max_new_tokens: 256
+  default_layers: [10, 20, 30, 40, 50, 58]
