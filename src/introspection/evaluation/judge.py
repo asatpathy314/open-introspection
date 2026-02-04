@@ -134,8 +134,7 @@ class LLMJudge:
                 response = self._client.chat.completions.create(
                     model=self._model,
                     messages=[{"role": "user", "content": prompt}],
-                    max_tokens=10,
-                    temperature=0,
+                    max_completion_tokens=1024,
                 )
                 raw = response.choices[0].message.content.strip().upper()
 

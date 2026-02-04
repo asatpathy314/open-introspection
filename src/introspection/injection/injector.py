@@ -4,12 +4,14 @@ Implements the core injection mechanism from Lindsey (2025):
     H^(l) = H^(l) + alpha * v^(l)
 
 where v is a unit-normalized concept vector and alpha controls injection strength.
-The injection is applied at every autoregressive step via nnsight's tracer.all().
+The injection is applied at every forward pass via a PyTorch forward hook on the
+target decoder layer.
 """
 
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
@@ -34,19 +36,95 @@ class InjectionConfig:
 
 
 class Injector:
-    """Performs concept vector injection during model generation via nnsight."""
+    """Performs concept vector injection during model generation.
+
+    Uses PyTorch forward hooks on the target decoder layer to inject
+    the concept vector into the residual stream at each forward pass.
+    """
 
     def __init__(self, model_manager: ModelManager) -> None:
         self._model = model_manager
 
     def _prepare_vector(self, vec: torch.Tensor) -> torch.Tensor:
-        """Cast vector to model's dtype for injection.
-
-        nnsight handles device placement within trace context,
-        so we only need to match dtype.
-        """
+        """Cast vector to model's dtype for injection."""
         target_dtype = self._model.dtype
         return vec.to(dtype=target_dtype)
+
+    @contextmanager
+    def _injection_hook(self, injection: InjectionConfig):
+        """Context manager that registers a forward hook for vector injection.
+
+        The hook adds alpha * vector to the hidden states at the target layer.
+        For apply_to='generated_only', skips the prefill pass (seq_len > 1).
+        """
+        model = self._model.load()
+        hf_model = model._model
+        vec = self._prepare_vector(injection.vector)
+
+        # Get the actual PyTorch layer module
+        if self._model.config.architecture == "gemma":
+            layer = hf_model.model.language_model.layers[injection.layer]
+        else:
+            layer = hf_model.model.layers[injection.layer]
+
+        def hook_fn(module, input, output):
+            # Decoder layer output is hidden_states tensor or (hidden_states, ...)
+            if isinstance(output, tuple):
+                hidden_states = output[0]
+            else:
+                hidden_states = output
+
+            # For "generated_only", skip prefill (seq_len > 1 with KV caching)
+            if injection.apply_to == "generated_only" and hidden_states.shape[1] > 1:
+                return output
+
+            v = vec.to(device=hidden_states.device, dtype=hidden_states.dtype)
+            modified = hidden_states + injection.alpha * v
+
+            if isinstance(output, tuple):
+                return (modified,) + tuple(output[1:])
+            return modified
+
+        handle = layer.register_forward_hook(hook_fn)
+        try:
+            yield
+        finally:
+            handle.remove()
+
+    def _generate(
+        self,
+        prompt: str,
+        max_new_tokens: int,
+        temperature: float,
+        do_sample: bool,
+    ) -> str:
+        """Run HuggingFace generate and decode the response."""
+        model = self._model.load()
+        hf_model = model._model
+        tokenizer = model.tokenizer
+
+        inputs = tokenizer(prompt, return_tensors="pt")
+        input_ids = inputs["input_ids"].to(hf_model.device)
+        attention_mask = inputs["attention_mask"].to(hf_model.device)
+
+        gen_kwargs = {
+            "max_new_tokens": max_new_tokens,
+            "do_sample": do_sample,
+        }
+        if do_sample and temperature > 0:
+            gen_kwargs["temperature"] = temperature
+
+        with torch.no_grad():
+            output_ids = hf_model.generate(
+                input_ids,
+                attention_mask=attention_mask,
+                **gen_kwargs,
+            )
+
+        # Decode only the generated tokens (skip input prompt)
+        generated_ids = output_ids[0, input_ids.shape[1]:]
+        response = tokenizer.decode(generated_ids, skip_special_tokens=True)
+        return response
 
     def generate_with_injection(
         self,
@@ -58,8 +136,8 @@ class Injector:
     ) -> str:
         """Generate text with a concept vector injected into the residual stream.
 
-        The vector is added to the specified layer's residual stream output
-        at every autoregressive generation step.
+        The vector is added to the specified layer's hidden states output
+        at every forward pass during generation.
 
         Args:
             prompt: Fully formatted prompt string (after chat template applied).
@@ -71,41 +149,17 @@ class Injector:
         Returns:
             Generated response text (decoded, special tokens stripped).
         """
-        model = self._model.load()
-        vec = self._prepare_vector(injection.vector)
-        layer_module = self._model.get_layer_output(injection.layer)
-
-        gen_kwargs = {
-            "max_new_tokens": max_new_tokens,
-            "do_sample": do_sample,
-        }
-        if do_sample and temperature > 0:
-            gen_kwargs["temperature"] = temperature
-
         try:
-            with torch.no_grad():
-                with model.generate(prompt, **gen_kwargs) as tracer:
-                    if injection.apply_to == "all":
-                        with tracer.all():
-                            h = layer_module.output[0]
-                            layer_module.output[0][:] = h + injection.alpha * vec
-                    else:
-                        # generated_only: skip the prefill pass (iter[0])
-                        with tracer.iter[1:]:
-                            h = layer_module.output[0]
-                            layer_module.output[0][:] = h + injection.alpha * vec
-
-                    output = model.generator.output.save()
-
-            response = model.tokenizer.decode(
-                output.value[0], skip_special_tokens=True
-            )
+            with self._injection_hook(injection):
+                response = self._generate(
+                    prompt, max_new_tokens, temperature, do_sample
+                )
         except RuntimeError as e:
-            # MPS fallback: if sampling fails, retry with greedy
             if "MPS" in str(e) and do_sample:
                 logger.warning("MPS sampling failed, retrying with greedy decoding")
                 return self.generate_with_injection(
-                    prompt, injection, max_new_tokens, temperature=0.0, do_sample=False
+                    prompt, injection, max_new_tokens,
+                    temperature=0.0, do_sample=False,
                 )
             raise
 
@@ -130,27 +184,16 @@ class Injector:
         Returns:
             Generated response text.
         """
-        model = self._model.load()
-
-        gen_kwargs = {
-            "max_new_tokens": max_new_tokens,
-            "do_sample": do_sample,
-        }
-        if do_sample and temperature > 0:
-            gen_kwargs["temperature"] = temperature
-
         try:
-            with torch.no_grad():
-                with model.generate(prompt, **gen_kwargs) as tracer:
-                    output = model.generator.output.save()
-
-            response = model.tokenizer.decode(
-                output.value[0], skip_special_tokens=True
+            response = self._generate(
+                prompt, max_new_tokens, temperature, do_sample
             )
         except RuntimeError as e:
             if "MPS" in str(e) and do_sample:
                 logger.warning("MPS sampling failed, retrying with greedy decoding")
-                return self.generate_clean(prompt, max_new_tokens, temperature=0.0, do_sample=False)
+                return self.generate_clean(
+                    prompt, max_new_tokens, temperature=0.0, do_sample=False
+                )
             raise
 
         MemoryTracker.force_cleanup()
@@ -179,31 +222,18 @@ class Injector:
         Returns:
             Full response text (prefill + generated continuation).
         """
-        # Construct prompt with prefill appended as if the model started responding
         full_prompt = prompt + prefill_text
-        model = self._model.load()
+        do_sample = temperature > 0
 
-        gen_kwargs = {
-            "max_new_tokens": max_new_tokens,
-            "do_sample": temperature > 0,
-        }
-        if temperature > 0:
-            gen_kwargs["temperature"] = temperature
+        if injection is not None:
+            with self._injection_hook(injection):
+                response = self._generate(
+                    full_prompt, max_new_tokens, temperature, do_sample
+                )
+        else:
+            response = self._generate(
+                full_prompt, max_new_tokens, temperature, do_sample
+            )
 
-        with torch.no_grad():
-            if injection is not None:
-                vec = self._prepare_vector(injection.vector)
-                layer_module = self._model.get_layer_output(injection.layer)
-
-                with model.generate(full_prompt, **gen_kwargs) as tracer:
-                    with tracer.all():
-                        h = layer_module.output[0]
-                        layer_module.output[0][:] = h + injection.alpha * vec
-                    output = model.generator.output.save()
-            else:
-                with model.generate(full_prompt, **gen_kwargs) as tracer:
-                    output = model.generator.output.save()
-
-        response = model.tokenizer.decode(output.value[0], skip_special_tokens=True)
         MemoryTracker.force_cleanup()
         return response

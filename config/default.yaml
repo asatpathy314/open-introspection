@@ -8,7 +8,7 @@ hardware:
 
 # Model selection
 model:
-  name: llama-8b         # llama-8b | qwen-32b | llama-70b
+  name: llama-8b         # gemma-4b | llama-8b | qwen-32b | llama-70b
   quantization: auto     # auto | none | int8 | int4
   max_new_tokens: 256
 
@@ -55,7 +55,7 @@ experiments:
 
 # Evaluation (LLM judge)
 evaluation:
-  judge_model: gpt-5-nano
+  judge_model: gpt-5-nano-2025-08-07
   max_retries: 3
   retry_delay: 1.0
   # API key loaded from OPENAI_API_KEY env var

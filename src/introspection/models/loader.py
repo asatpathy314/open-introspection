@@ -74,6 +74,13 @@ class ModelManager:
 
         self._model = LanguageModel(self._config.model_id, **kwargs)
 
+        # Warmup: materialize weights from meta tensors to the target device.
+        # nnsight uses meta tensors until the first forward pass; without this,
+        # any direct model access would fail with "meta tensor" errors.
+        with torch.no_grad():
+            with self._model.generate(".", max_new_tokens=1, do_sample=False) as tracer:
+                self._model.generator.output.save()
+
         MemoryTracker.log_usage("after_model_load")
         logger.info(
             "Model loaded: %s (device_map=%s, dtype=%s, dispatch=%s)",
@@ -93,13 +100,16 @@ class ModelManager:
             logger.info("Model unloaded: %s", self._config.friendly_name)
 
     def get_layer_output(self, layer_idx: int):
-        """Return the nnsight proxy for model.model.layers[layer_idx].output.
+        """Return the nnsight proxy for a decoder layer.
 
-        Both Llama and Qwen use model.model.layers[N] in HuggingFace transformers.
+        Llama and Qwen use model.model.layers[N] in HuggingFace transformers.
+        Gemma 3 is multimodal and uses model.language_model.layers[N].
         The output is a tuple where [0] is the hidden states tensor.
         """
         model = self.load()
-        return model.model.model.layers[layer_idx]
+        if self._config.architecture == "gemma":
+            return model.model.language_model.layers[layer_idx]
+        return model.model.layers[layer_idx]
 
     def get_tokenizer(self) -> PreTrainedTokenizerBase:
         """Return the tokenizer from the loaded model."""

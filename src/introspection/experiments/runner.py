@@ -71,7 +71,7 @@ class ExperimentRunner:
         device_info = self._device.detect()
 
         # Model
-        model_name = model_override or self._config.get("model", {}).get("name", "llama-8b")
+        model_name = model_override or self._config.get("model", {}).get("name", "gemma-4b")
         model_config = get_model_config(model_name)
 
         # Override quantization from config if specified
@@ -129,7 +129,7 @@ class ExperimentRunner:
             config = yaml.safe_load(f)
 
         # Load model-specific config if referenced
-        model_name = config.get("model", {}).get("name", "llama-8b")
+        model_name = config.get("model", {}).get("name", "gemma-4b")
         model_config_path = config_path.parent / "models" / f"{model_name}.yaml"
         if model_config_path.exists():
             with open(model_config_path) as f:

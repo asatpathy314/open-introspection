@@ -15,7 +15,7 @@ class ModelConfig:
     num_layers: int
     hidden_dim: int
     param_count_b: float
-    architecture: Literal["llama", "qwen"]
+    architecture: Literal["llama", "qwen", "gemma"]
     quantization: str | None = None
     max_new_tokens: int = 256
     default_layers: list[int] = field(default_factory=list)
@@ -64,10 +64,23 @@ LLAMA_70B = ModelConfig(
     default_layers=[13, 26, 40, 53, 66, 76],
 )
 
+GEMMA_4B = ModelConfig(
+    model_id="google/gemma-3-4b-it",
+    friendly_name="gemma-4b",
+    num_layers=34,
+    hidden_dim=2560,
+    param_count_b=4.0,
+    architecture="gemma",
+    quantization=None,
+    max_new_tokens=256,
+    default_layers=[5, 9, 13, 17, 20, 23, 27, 31],
+)
+
 MODEL_REGISTRY: dict[str, ModelConfig] = {
     "llama-8b": LLAMA_8B,
     "qwen-32b": QWEN_32B,
     "llama-70b": LLAMA_70B,
+    "gemma-4b": GEMMA_4B,
 }
 
 

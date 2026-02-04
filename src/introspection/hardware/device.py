@@ -103,12 +103,12 @@ class DeviceManager:
             return "auto"
 
         if info.backend == "mps":
-            effective_size = self.estimate_model_memory(model_size_gb, quantization)
+            # model_size_gb is already estimated by the caller
             # Reserve ~20% of memory for activations, KV cache, OS
             available = info.total_memory_gb * 0.7
-            if effective_size > available:
+            if model_size_gb > available:
                 raise MemoryError(
-                    f"Model requires ~{effective_size:.1f}GB but only "
+                    f"Model requires ~{model_size_gb:.1f}GB but only "
                     f"~{available:.1f}GB available on MPS (70% of {info.total_memory_gb:.1f}GB). "
                     f"Consider using quantization."
                 )

@@ -60,13 +60,30 @@ class VectorExtractor:
 
         with torch.no_grad():
             with model.trace(text) as tracer:
-                hidden = layer_module.output[0]
-                if token_position == "last":
-                    vec = hidden[0, -1, :].save()
-                else:
-                    vec = hidden[0, :, :].mean(dim=0).save()
+                # Layer output is a tuple (hidden_states, ...) for decoder layers
+                # Extract hidden states (first element of tuple)
+                output_tuple = layer_module.output.save()
 
-        return vec.value.detach().cpu().float()
+        # Get the actual value after tracing
+        # .save() may return a proxy with .value or the value directly
+        if hasattr(output_tuple, 'value'):
+            output_value = output_tuple.value
+        else:
+            output_value = output_tuple
+
+        # Handle tuple output - get hidden states (first element)
+        if isinstance(output_value, tuple):
+            hidden = output_value[0]
+        else:
+            hidden = output_value
+
+        # Extract the token position
+        if token_position == "last":
+            vec = hidden[0, -1, :]
+        else:
+            vec = hidden[0, :, :].mean(dim=0)
+
+        return vec.detach().cpu().float()
 
     def compute_concept_vector(
         self,
