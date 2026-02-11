@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import re
 import time
 from pathlib import Path
@@ -10,6 +11,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from nnsight import LanguageModel
 
+import concept_vectors as concept_vectors_module
 from concept_vectors import compute_concept_vectors
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -114,6 +116,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=3,
         help="How many times to retry model init / vector extraction on transient failures.",
     )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=16,
+        help=(
+            "Number of prompts per NDIF trace job. Lower is slower but gives better "
+            "progress logging and more robust retries."
+        ),
+    )
     return parser
 
 
@@ -179,6 +190,12 @@ def main() -> None:
     print(
         f"[info] Concepts: {len(unique_concepts)} | Baselines: {len(baseline_words)}"
     )
+    print(f"[info] Prompt chunk size (compat mode): {args.chunk_size}")
+    print("[info] Execution mode: reliable per-prompt remote traces (chunk-size ignored).")
+    print(f"[info] concept_vectors module: {concept_vectors_module.__file__}")
+    source = inspect.getsource(concept_vectors_module._collect_last_token_activations)
+    if ".stop()" in source:
+        print("[warn] Loaded code still contains .stop(); restart after pulling latest file.")
     print("[info] Starting vector extraction job...")
     start = time.time()
 
@@ -190,6 +207,8 @@ def main() -> None:
             baseline_words=baseline_words,
             layers=layers,
             remote=remote,
+            chunk_size=args.chunk_size,
+            logger=lambda message: print(f"[trace] {message}", flush=True),
         ),
         max_retries=args.max_retries,
     )

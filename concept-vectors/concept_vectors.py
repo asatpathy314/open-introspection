@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+from typing import Callable
 
 import torch
 from dotenv import load_dotenv
@@ -41,7 +42,9 @@ def _collect_last_token_activations(
     prompts: list[str],
     layers: list[int],
     remote: bool,
-) -> dict[int, dict[int, torch.Tensor]]:
+    chunk_size: int | None = None,
+    logger: Callable[[str], None] | None = None,
+) -> list[dict[int, torch.Tensor]]:
     """
     Collect per-prompt, per-layer residual activations at the final token.
 
@@ -52,21 +55,65 @@ def _collect_last_token_activations(
         }
       }
     """
-    activations: dict[int, dict[int, torch.Tensor]] = {
-        prompt_idx: {} for prompt_idx in range(len(prompts))
-    }
+    activations: list[dict[int, torch.Tensor]] = [{} for _ in prompts]
+    def _layer_envoy(layer_idx: int):
+        if hasattr(model, "model") and hasattr(model.model, "layers"):
+            return model.model.layers[layer_idx]
+        if hasattr(model, "transformer") and hasattr(model.transformer, "h"):
+            return model.transformer.h[layer_idx]
+        raise AttributeError("Could not locate transformer layers on this LanguageModel.")
 
-    with model.trace(remote=remote) as tracer:
-        for prompt_idx, prompt in enumerate(prompts):
+    def _last_token_hidden(hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        Normalize hidden state shapes across local/remote backends.
+
+        Observed shapes:
+        - [batch, seq, hidden]
+        - [seq, hidden]
+        """
+        if hidden_states.ndim == 3:
+            return hidden_states[0, -1, :]
+        if hidden_states.ndim == 2:
+            return hidden_states[-1, :]
+        if hidden_states.ndim == 1:
+            return hidden_states
+        raise ValueError(
+            f"Unexpected hidden-state shape {tuple(hidden_states.shape)}; "
+            "expected 1D, 2D, or 3D tensor."
+        )
+
+    for prompt_idx, prompt in enumerate(prompts):
+        if logger:
+            logger(f"Tracing prompt {prompt_idx + 1}/{len(prompts)}")
+
+        prompt_tensor = None
+        with model.trace(remote=remote) as tracer:
             with tracer.invoke(prompt):
+                layer_rows = []
                 for layer_idx in layers:
-                    last_token = (
-                        model.model.layers[layer_idx].output[0][0, -1, :].detach().cpu()
-                    )
-                    activations[prompt_idx][layer_idx] = last_token.save()
+                    layer_hidden = _layer_envoy(layer_idx).output[0]
+                    last_token = _last_token_hidden(layer_hidden).detach().cpu()
+                    layer_rows.append(last_token)
 
-                # Stop once the highest requested layer has run to save compute.
-                tracer.stop()
+                prompt_tensor = torch.stack(layer_rows, dim=0).save()
+
+        if prompt_tensor is None:
+            raise RuntimeError(
+                f"Missing activations after trace. prompt_idx={prompt_idx}, no tensor returned."
+            )
+        if prompt_tensor.ndim != 2:
+            raise RuntimeError(
+                f"Unexpected prompt activation shape for prompt_idx={prompt_idx}: "
+                f"{tuple(prompt_tensor.shape)} (expected 2D: layers x hidden)."
+            )
+        if prompt_tensor.shape[0] != len(layers):
+            raise RuntimeError(
+                f"Layer count mismatch for prompt_idx={prompt_idx}: "
+                f"{prompt_tensor.shape[0]} vs expected {len(layers)}."
+            )
+
+        for layer_pos, layer_idx in enumerate(layers):
+            activations[prompt_idx][layer_idx] = prompt_tensor[layer_pos]
 
     return activations
 
@@ -77,6 +124,8 @@ def compute_baseline_activations(
     layers: list[int] | None = None,
     remote: bool = True,
     path: str | Path = _BASELINE_CACHE_PATH,
+    chunk_size: int | None = None,
+    logger: Callable[[str], None] | None = None,
 ) -> dict[int, torch.Tensor]:
     """
     Compute the baseline activations using the provided baseline words.
@@ -105,14 +154,13 @@ def compute_baseline_activations(
         prompts=baseline_prompts,
         layers=layer_indices,
         remote=remote,
+        chunk_size=chunk_size,
+        logger=logger,
     )
 
     baseline_mean: dict[int, torch.Tensor] = {}
     for layer_idx in layer_indices:
-        layer_samples = [
-            baseline_activations[prompt_idx][layer_idx]
-            for prompt_idx in range(len(baseline_words))
-        ]
+        layer_samples = [prompt[layer_idx] for prompt in baseline_activations]
         baseline_mean[layer_idx] = torch.stack(layer_samples, dim=0).mean(dim=0)
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -133,6 +181,8 @@ def compute_concept_vectors(
     baseline_words: list[str],
     layers: list[int],
     remote: bool = True,
+    chunk_size: int | None = None,
+    logger: Callable[[str], None] | None = None,
 ) -> dict[int, dict[str, torch.Tensor]]:
     """
     For each layer and word, extract residual stream activation at the last token
@@ -172,14 +222,21 @@ def compute_concept_vectors(
         prompts=all_prompts,
         layers=layer_indices,
         remote=remote,
+        chunk_size=chunk_size,
+        logger=logger,
     )
 
     # Step 3: On client, compute mean activation across baseline_words per layer.
     baseline_start = len(words)
+    if logger:
+        logger(
+            f"Post-processing {len(activations)} prompts "
+            f"(concept={len(words)}, baseline={len(baseline_words)})"
+        )
     baseline_mean: dict[int, torch.Tensor] = {}
     for layer_idx in layer_indices:
         baseline_layer_samples = [
-            activations[baseline_start + i][layer_idx] for i in range(len(baseline_words))
+            prompt[layer_idx] for prompt in activations[baseline_start:]
         ]
         baseline_mean[layer_idx] = torch.stack(baseline_layer_samples, dim=0).mean(dim=0)
 
