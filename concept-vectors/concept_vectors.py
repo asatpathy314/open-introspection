@@ -8,7 +8,7 @@ import torch
 from dotenv import load_dotenv
 from nnsight import CONFIG, LanguageModel
 
-from prompts import build_concept_prompt
+from prompts import build_concept_prompt_messages, tokenize_concept_prompt
 
 _ROOT_DIR = Path(__file__).resolve().parents[1]
 _VECTORS_DIR = _ROOT_DIR / "data" / "vectors"
@@ -37,16 +37,38 @@ def _normalize_layers(layers: list[int]) -> list[int]:
     return unique_sorted
 
 
+def _model_key(model: LanguageModel | None) -> str | None:
+    if model is None:
+        return None
+    if hasattr(model, "to_model_key"):
+        try:
+            return model.to_model_key()
+        except Exception:  # noqa: BLE001
+            pass
+    return getattr(model, "repo_id", None)
+
+
+def _layer_envoy(model: LanguageModel, layer_idx: int):
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        return model.model.layers[layer_idx]
+    if hasattr(model, "transformer") and hasattr(model.transformer, "h"):
+        return model.transformer.h[layer_idx]
+    raise AttributeError("Could not locate transformer layers on this LanguageModel.")
+
+
+def _resolve_layer_envoys(model: LanguageModel, layers: list[int]):
+    return [_layer_envoy(model, layer_idx) for layer_idx in layers]
+
+
 def _collect_last_token_activations(
     model: LanguageModel,
-    prompts: list[str],
+    prompt_messages: list[list[dict[str, str]]],
     layers: list[int],
     remote: bool,
-    chunk_size: int | None = None,
     logger: Callable[[str], None] | None = None,
 ) -> list[dict[int, torch.Tensor]]:
     """
-    Collect per-prompt, per-layer residual activations at the final token.
+    Collect per-prompt, per-layer residual activations at the final prefill token.
 
     Returns:
       {
@@ -55,46 +77,35 @@ def _collect_last_token_activations(
         }
       }
     """
-    activations: list[dict[int, torch.Tensor]] = [{} for _ in prompts]
-    def _layer_envoy(layer_idx: int):
-        if hasattr(model, "model") and hasattr(model.model, "layers"):
-            return model.model.layers[layer_idx]
-        if hasattr(model, "transformer") and hasattr(model.transformer, "h"):
-            return model.transformer.h[layer_idx]
-        raise AttributeError("Could not locate transformer layers on this LanguageModel.")
+    if getattr(model, "tokenizer", None) is None:
+        raise RuntimeError("LanguageModel tokenizer is not initialized.")
 
-    def _last_token_hidden(hidden_states: torch.Tensor) -> torch.Tensor:
-        """
-        Normalize hidden state shapes across local/remote backends.
-
-        Observed shapes:
-        - [batch, seq, hidden]
-        - [seq, hidden]
-        """
-        if hidden_states.ndim == 3:
-            return hidden_states[0, -1, :]
-        if hidden_states.ndim == 2:
-            return hidden_states[-1, :]
-        if hidden_states.ndim == 1:
-            return hidden_states
-        raise ValueError(
-            f"Unexpected hidden-state shape {tuple(hidden_states.shape)}; "
-            "expected 1D, 2D, or 3D tensor."
-        )
-
-    for prompt_idx, prompt in enumerate(prompts):
+    layer_envoys = _resolve_layer_envoys(model, layers)
+    activations: list[dict[int, torch.Tensor]] = [{} for _ in prompt_messages]
+    for prompt_idx, messages in enumerate(prompt_messages):
         if logger:
-            logger(f"Tracing prompt {prompt_idx + 1}/{len(prompts)}")
+            logger(f"Tracing prompt {prompt_idx + 1}/{len(prompt_messages)}")
+
+        tokenized_prompt = tokenize_concept_prompt(model.tokenizer, messages)
+        if type(tokenized_prompt).__module__.startswith(
+            "transformers.tokenization_utils_base"
+        ):
+            raise RuntimeError(
+                "Prompt payload is a transformers BatchEncoding. NDIF remote tracing "
+                "requires plain dict/tensor inputs. Convert tokenized prompts to a "
+                "plain dict before tracer.invoke(...)."
+            )
 
         prompt_tensor = None
         with model.trace(remote=remote) as tracer:
-            with tracer.invoke(prompt):
+            with tracer.invoke(tokenized_prompt):
                 layer_rows = []
-                for layer_idx in layers:
-                    layer_hidden = _layer_envoy(layer_idx).output[0]
-                    last_token = _last_token_hidden(layer_hidden).detach().cpu()
-                    layer_rows.append(last_token)
-
+                for layer_envoy in layer_envoys:
+                    layer_hidden = layer_envoy.output[0]
+                    # Works for both [batch, seq, hidden] and [seq, hidden].
+                    layer_rows.append(
+                        layer_hidden[..., -1, :].squeeze(0).detach().cpu()
+                    )
                 prompt_tensor = torch.stack(layer_rows, dim=0).save()
 
         if prompt_tensor is None:
@@ -118,43 +129,62 @@ def _collect_last_token_activations(
     return activations
 
 
+def _baseline_cache_matches(
+    payload: dict,
+    baseline_words: list[str] | None,
+    layers: list[int] | None,
+    model_key: str | None,
+) -> bool:
+    if "baseline_mean" not in payload:
+        return False
+    if baseline_words is not None and payload.get("baseline_words") != baseline_words:
+        return False
+    if layers is not None and payload.get("layers") != layers:
+        return False
+    if model_key is not None and payload.get("model_key") not in (None, model_key):
+        return False
+    return True
+
+
 def compute_baseline_activations(
     model: LanguageModel | None = None,
     baseline_words: list[str] | None = None,
     layers: list[int] | None = None,
     remote: bool = True,
     path: str | Path = _BASELINE_CACHE_PATH,
-    chunk_size: int | None = None,
     logger: Callable[[str], None] | None = None,
 ) -> dict[int, torch.Tensor]:
     """
-    Compute the baseline activations using the provided baseline words.
-    Save this into the directory, and if it's already been saved in /data/vectors/baseline
-    then just load and return those.
+    Load baseline activations from cache when metadata matches; otherwise compute
+    and cache fresh baseline means.
     """
     cache_path = Path(path)
+    layer_indices = _normalize_layers(layers) if layers is not None else None
+    model_key = _model_key(model)
+
     if cache_path.exists():
         payload = torch.load(cache_path, map_location="cpu", weights_only=True)
-        if isinstance(payload, dict) and "baseline_mean" in payload:
-            return payload["baseline_mean"]
-        return payload
+        if isinstance(payload, dict):
+            if _baseline_cache_matches(payload, baseline_words, layer_indices, model_key):
+                return payload["baseline_mean"]
+        elif baseline_words is None and layer_indices is None and model_key is None:
+            return payload
 
-    if model is None or baseline_words is None or layers is None:
+    if model is None or baseline_words is None or layer_indices is None:
         raise ValueError(
-            "Cache miss for baseline activations. Provide model, baseline_words, and layers."
+            "Cache miss or metadata mismatch for baseline activations. "
+            "Provide model, baseline_words, and layers."
         )
     if not baseline_words:
         raise ValueError("`baseline_words` must be non-empty.")
 
     _configure_ndif(remote=remote)
-    layer_indices = _normalize_layers(layers)
-    baseline_prompts = [build_concept_prompt(word) for word in baseline_words]
+    baseline_prompts = [build_concept_prompt_messages(word) for word in baseline_words]
     baseline_activations = _collect_last_token_activations(
         model=model,
-        prompts=baseline_prompts,
+        prompt_messages=baseline_prompts,
         layers=layer_indices,
         remote=remote,
-        chunk_size=chunk_size,
         logger=logger,
     )
 
@@ -168,6 +198,7 @@ def compute_baseline_activations(
         {
             "baseline_words": baseline_words,
             "layers": layer_indices,
+            "model_key": model_key,
             "baseline_mean": baseline_mean,
         },
         cache_path,
@@ -181,12 +212,11 @@ def compute_concept_vectors(
     baseline_words: list[str],
     layers: list[int],
     remote: bool = True,
-    chunk_size: int | None = None,
     logger: Callable[[str], None] | None = None,
 ) -> dict[int, dict[str, torch.Tensor]]:
     """
-    For each layer and word, extract residual stream activation at the last token
-    of 'Tell me about {word}.' and subtract mean baseline activation.
+    For each layer and word, extract residual stream activation at the final
+    prefill token of the chat-formatted concept prompt and subtract mean baseline.
 
     Returns: {layer_idx: {word: concept_vector_tensor}}
     """
@@ -199,6 +229,7 @@ def compute_concept_vectors(
 
     _configure_ndif(remote=remote)
     layer_indices = _normalize_layers(layers)
+    model_key = _model_key(model)
 
     if _CONCEPT_CACHE_PATH.exists():
         payload = torch.load(_CONCEPT_CACHE_PATH, map_location="cpu", weights_only=True)
@@ -208,39 +239,30 @@ def compute_concept_vectors(
             and payload.get("words") == words
             and payload.get("baseline_words") == baseline_words
             and payload.get("layers") == layer_indices
+            and payload.get("model_key") in (None, model_key)
         ):
             return payload["concept_vectors"]
 
-    # Step 1: For each word, build prompt via build_concept_prompt().
-    concept_prompts = [build_concept_prompt(word) for word in words]
-    baseline_prompts = [build_concept_prompt(word) for word in baseline_words]
-    all_prompts = [*concept_prompts, *baseline_prompts]
-
-    # Step 2: Batch all words + baseline_words into one remote trace and use invoke per prompt.
-    activations = _collect_last_token_activations(
+    baseline_mean = compute_baseline_activations(
         model=model,
-        prompts=all_prompts,
+        baseline_words=baseline_words,
         layers=layer_indices,
         remote=remote,
-        chunk_size=chunk_size,
         logger=logger,
     )
 
-    # Step 3: On client, compute mean activation across baseline_words per layer.
-    baseline_start = len(words)
-    if logger:
-        logger(
-            f"Post-processing {len(activations)} prompts "
-            f"(concept={len(words)}, baseline={len(baseline_words)})"
-        )
-    baseline_mean: dict[int, torch.Tensor] = {}
-    for layer_idx in layer_indices:
-        baseline_layer_samples = [
-            prompt[layer_idx] for prompt in activations[baseline_start:]
-        ]
-        baseline_mean[layer_idx] = torch.stack(baseline_layer_samples, dim=0).mean(dim=0)
+    concept_prompts = [build_concept_prompt_messages(word) for word in words]
+    activations = _collect_last_token_activations(
+        model=model,
+        prompt_messages=concept_prompts,
+        layers=layer_indices,
+        remote=remote,
+        logger=logger,
+    )
 
-    # Step 4: Subtract mean from each word's activation to get concept direction.
+    if logger:
+        logger(f"Post-processing {len(activations)} concept prompts")
+
     concept_vectors: dict[int, dict[str, torch.Tensor]] = {
         layer_idx: {} for layer_idx in layer_indices
     }
@@ -250,28 +272,17 @@ def compute_concept_vectors(
                 activations[word_idx][layer_idx] - baseline_mean[layer_idx]
             )
 
-    # Step 5: Cache result to disk as concept_vectors.pt.
     _CONCEPT_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
             "words": words,
             "baseline_words": baseline_words,
             "layers": layer_indices,
+            "model_key": model_key,
             "concept_vectors": concept_vectors,
             "baseline_mean": baseline_mean,
         },
         _CONCEPT_CACHE_PATH,
-    )
-
-    # Also cache baseline means in dedicated baseline directory.
-    _BASELINE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "baseline_words": baseline_words,
-            "layers": layer_indices,
-            "baseline_mean": baseline_mean,
-        },
-        _BASELINE_CACHE_PATH,
     )
 
     return concept_vectors

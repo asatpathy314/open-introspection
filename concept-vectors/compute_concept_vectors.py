@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import inspect
 import re
 import time
 from pathlib import Path
@@ -11,8 +10,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 from nnsight import LanguageModel
 
-import concept_vectors as concept_vectors_module
 from concept_vectors import compute_concept_vectors
+from prompts import build_concept_prompt_messages, tokenize_concept_prompt
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_MODEL = "meta-llama/Llama-3.1-70B-Instruct"
@@ -117,12 +116,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="How many times to retry model init / vector extraction on transient failures.",
     )
     parser.add_argument(
-        "--chunk-size",
-        type=int,
-        default=16,
+        "--dry-run",
+        action="store_true",
         help=(
-            "Number of prompts per NDIF trace job. Lower is slower but gives better "
-            "progress logging and more robust retries."
+            "Run one scan/validate trace and print output shapes, then exit without "
+            "computing vectors."
         ),
     )
     return parser
@@ -142,6 +140,43 @@ def run_with_retries(task_name: str, fn, max_retries: int):
             )
             time.sleep(wait_seconds)
             wait_seconds = min(wait_seconds * 2, 180)
+
+
+def _layer_envoy(model: LanguageModel, layer_idx: int):
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        return model.model.layers[layer_idx]
+    if hasattr(model, "transformer") and hasattr(model.transformer, "h"):
+        return model.transformer.h[layer_idx]
+    raise AttributeError("Could not locate transformer layers on this LanguageModel.")
+
+
+def run_dry_run(
+    model: LanguageModel,
+    concept_word: str,
+    layer_idx: int,
+    remote: bool,
+) -> None:
+    if getattr(model, "tokenizer", None) is None:
+        raise RuntimeError("LanguageModel tokenizer is not initialized.")
+
+    messages = build_concept_prompt_messages(concept_word)
+    tokenized_prompt = tokenize_concept_prompt(model.tokenizer, messages)
+    layer_envoy = _layer_envoy(model, layer_idx)
+
+    hidden = None
+    last_token = None
+    with model.trace(remote=remote, scan=True, validate=True) as tracer:
+        with tracer.invoke(tokenized_prompt):
+            layer_hidden = layer_envoy.output[0]
+            hidden = layer_hidden.detach().cpu().save()
+            last_token = layer_hidden[..., -1, :].squeeze(0).detach().cpu().save()
+
+    if hidden is None or last_token is None:
+        raise RuntimeError("Dry-run trace did not return expected tensors.")
+
+    print(f"[dry-run] Prompt: Tell me about {concept_word}.")
+    print(f"[dry-run] Layer {layer_idx} hidden shape: {tuple(hidden.shape)}")
+    print(f"[dry-run] Layer {layer_idx} last-token shape: {tuple(last_token.shape)}")
 
 
 def main() -> None:
@@ -190,12 +225,22 @@ def main() -> None:
     print(
         f"[info] Concepts: {len(unique_concepts)} | Baselines: {len(baseline_words)}"
     )
-    print(f"[info] Prompt chunk size (compat mode): {args.chunk_size}")
-    print("[info] Execution mode: reliable per-prompt remote traces (chunk-size ignored).")
-    print(f"[info] concept_vectors module: {concept_vectors_module.__file__}")
-    source = inspect.getsource(concept_vectors_module._collect_last_token_activations)
-    if ".stop()" in source:
-        print("[warn] Loaded code still contains .stop(); restart after pulling latest file.")
+
+    if args.dry_run:
+        print("[info] Running dry-run trace (scan=True, validate=True) on one prompt...")
+        run_with_retries(
+            task_name="dry-run validation",
+            fn=lambda: run_dry_run(
+                model=model,
+                concept_word=unique_concepts[0],
+                layer_idx=layers[0],
+                remote=remote,
+            ),
+            max_retries=args.max_retries,
+        )
+        print("[done] Dry-run completed. Exiting without computing concept vectors.")
+        return
+
     print("[info] Starting vector extraction job...")
     start = time.time()
 
@@ -207,7 +252,6 @@ def main() -> None:
             baseline_words=baseline_words,
             layers=layers,
             remote=remote,
-            chunk_size=args.chunk_size,
             logger=lambda message: print(f"[trace] {message}", flush=True),
         ),
         max_retries=args.max_retries,
