@@ -2,6 +2,7 @@
 
 SYSTEM_PROMPT = None
 
+
 def build_prefill_trial_messages(
     sentence: str,
     prefill_word: str,
@@ -47,6 +48,7 @@ def build_prefill_trial_messages(
         }
     )
     return messages
+
 
 def tokenize_with_prefill(tokenizer, messages: list[dict]) -> dict:
     """
