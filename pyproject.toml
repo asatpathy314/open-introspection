@@ -5,6 +5,12 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "huggingface-hub>=1.4.0",
     "nnsight>=0.5.15",
+    "openai>=2.20.0",
     "python-dotenv>=1.2.1",
+    "pyyaml>=6.0.3",
+    "tenacity>=9.1.4",
+    "torch>=2.10.0",
+    "transformers>=5.1.0",
 ]
