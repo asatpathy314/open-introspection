@@ -165,7 +165,9 @@ def compute_baseline_activations(
     if cache_path.exists():
         payload = torch.load(cache_path, map_location="cpu", weights_only=True)
         if isinstance(payload, dict):
-            if _baseline_cache_matches(payload, baseline_words, layer_indices, model_key):
+            if _baseline_cache_matches(
+                payload, baseline_words, layer_indices, model_key
+            ):
                 return payload["baseline_mean"]
         elif baseline_words is None and layer_indices is None and model_key is None:
             return payload

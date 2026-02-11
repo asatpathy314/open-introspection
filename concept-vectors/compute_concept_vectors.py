@@ -222,12 +222,12 @@ def main() -> None:
         f"[info] Model: {args.model} "
         f"(revision={args.revision or 'main'}, layers={len(layers)}, remote={remote})"
     )
-    print(
-        f"[info] Concepts: {len(unique_concepts)} | Baselines: {len(baseline_words)}"
-    )
+    print(f"[info] Concepts: {len(unique_concepts)} | Baselines: {len(baseline_words)}")
 
     if args.dry_run:
-        print("[info] Running dry-run trace (scan=True, validate=True) on one prompt...")
+        print(
+            "[info] Running dry-run trace (scan=True, validate=True) on one prompt..."
+        )
         run_with_retries(
             task_name="dry-run validation",
             fn=lambda: run_dry_run(
@@ -258,10 +258,7 @@ def main() -> None:
     )
 
     elapsed = time.time() - start
-    print(
-        f"[done] Cached concept vectors to {DEFAULT_CACHE_PATH} "
-        f"in {elapsed:.1f}s."
-    )
+    print(f"[done] Cached concept vectors to {DEFAULT_CACHE_PATH} in {elapsed:.1f}s.")
     print(
         "[done] Tensor map shape summary: "
         f"{len(concept_vectors)} layers x {len(unique_concepts)} concepts."
