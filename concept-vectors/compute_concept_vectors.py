@@ -1,268 +1,487 @@
-"""CLI to precompute and cache concept vectors for Llama-3.1-70B-Instruct."""
+#!/usr/bin/env python3
+"""
+compute_concept_vectors.py
 
-from __future__ import annotations
+Extracts concept vectors following Lindsey et al. ("Emergent Introspective Awareness")
+using nnsight + NDIF remote execution on Llama-3.1-70B-Instruct.
 
-import argparse
+Two-phase execution:
+  Phase A: Compute baseline vectors (sequential, for correctness).
+  Phase B: Compute all concept vectors with async/parallel tracing (blocking=False).
+
+Filename convention for saved vectors:
+  data/vectors/llama-3.1-70b-instruct/<concept_slug>_layer<L>.pt
+  data/vectors/llama-3.1-70b-instruct/<concept_slug>_all_layers.pt
+  data/vectors/llama-3.1-70b-instruct/<concept_slug>_metadata.json
+  data/vectors/llama-3.1-70b-instruct/baseline_mean.pt
+  data/vectors/llama-3.1-70b-instruct/baseline_metadata.json
+
+Where <concept_slug> is the lowercase, stripped concept name with spaces replaced by underscores.
+"""
+
+import os
 import re
+import json
 import time
+import hashlib
+import tempfile
+import shutil
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
-from dotenv import load_dotenv
-from nnsight import LanguageModel
+import torch
+import nnsight
 
-from concept_vectors import compute_concept_vectors
-from prompts import build_concept_prompt_messages, tokenize_concept_prompt
+# ============================================================================
+# Global Configuration
+# ============================================================================
 
-ROOT_DIR = Path(__file__).resolve().parents[1]
-DEFAULT_MODEL = "meta-llama/Llama-3.1-70B-Instruct"
-DEFAULT_CONCEPTS_FILE = ROOT_DIR / "data" / "concepts.txt"
-DEFAULT_BASELINE_FILE = ROOT_DIR / "data" / "baseline_words.txt"
-DEFAULT_CACHE_PATH = ROOT_DIR / "data" / "vectors" / "concept_vectors.pt"
+MODEL = os.environ.get("MODEL", "meta-llama/Llama-3.1-70B-Instruct")
+OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "data/vectors/llama-3.1-70b-instruct"))
+MAX_IN_FLIGHT = int(os.environ.get("MAX_IN_FLIGHT", "8"))
+OVERWRITE = os.environ.get("OVERWRITE", "").lower() in ("1", "true", "yes")
+POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "2.0"))
+POLL_TIMEOUT = float(os.environ.get("POLL_TIMEOUT", "600.0"))
 
+# Verification thresholds
+ATOL = float(os.environ.get("ATOL", "1e-5"))
+COS_MIN = float(os.environ.get("COS_MIN", "0.9999"))
+VERIFY_N = int(os.environ.get("VERIFY_N", "5"))
 
-def parse_word_file(path: Path) -> list[str]:
-    text = path.read_text(encoding="utf-8")
-    return [word.strip() for word in re.split(r"[,\n]", text) if word.strip()]
+# Lindsey et al. baseline words (100 words, as in the ground-truth code)
+BASELINE_WORDS_STR = (
+    "Desks, Jackets, Gondolas, Laughter, Intelligence, Bicycles, Chairs, "
+    "Orchestras, Sand, Pottery, Arrowheads, Jewelry, Daffodils, Plateaus, "
+    "Estuaries, Quilts, Moments, Bamboo, Ravines, Archives, Hieroglyphs, "
+    "Stars, Clay, Fossils, Wildlife, Flour, Traffic, Bubbles, Honey, Geodes, "
+    "Magnets, Ribbons, Zigzags, Puzzles, Tornadoes, Anthills, Galaxies, "
+    "Poverty, Diamonds, Universes, Vinegar, Nebulae, Knowledge, Marble, Fog, "
+    "Rivers, Scrolls, Silhouettes, Marbles, Cakes, Valleys, Whispers, "
+    "Pendulums, Towers, Tables, Glaciers, Whirlpools, Jungles, Wool, Anger, "
+    "Ramparts, Flowers, Research, Hammers, Clouds, Justice, Dogs, Butterflies, "
+    "Needles, Fortresses, Bonfires, Skyscrapers, Caravans, Patience, Bacon, "
+    "Velocities, Smoke, Electricity, Sunsets, Anchors, Parchments, Courage, "
+    "Statues, Oxygen, Time, Butterflies, Fabric, Pasta, Snowflakes, Mountains, "
+    "Echoes, Pianos, Sanctuaries, Abysses, Air, Dewdrops, Gardens, Literature, "
+    "Rice, Enigmas"
+)
+BASELINE_WORDS = [w.strip() for w in BASELINE_WORDS_STR.split(",") if w.strip()]
 
+# Concepts to compute vectors for. By default, use a sample set.
+# The ground truth code demonstrates with "Dust"; extend as needed.
+CONCEPTS = (
+    "Dust, Satellites, Trumpets, Origami, Illusions, Cameras, Lightning, "
+    "Constellations, Treasures, Phones, Trees, Avalanches, Mirrors, Fountains, "
+    "Quarries, Sadness, Xylophones, Secrecy, Oceans, Information, Deserts, "
+    "Kaleidoscopes, Sugar, Vegetables, Poetry, Aquariums, Bags, Peace, Caverns, "
+    "Memories, Frosts, Volcanoes, Boulders, Harmonies, Masquerades, Rubber, Plastic, "
+    "Blood, Amphitheaters, Contraptions, Youths, Dynasties, Snow, Dirigibles, Algorithms, "
+    "Denim, Monoliths, Milk, Bread, Silver"
+)
 
-def unique_preserve_order(values: list[str]) -> list[str]:
-    seen: set[str] = set()
-    output: list[str] = []
-    for value in values:
-        if value in seen:
-            continue
-        seen.add(value)
-        output.append(value)
-    return output
+# ============================================================================
+# Helpers
+# ============================================================================
 
-
-def parse_layers(layers_arg: str, num_hidden_layers: int) -> list[int]:
-    if layers_arg.lower() == "all":
-        return list(range(num_hidden_layers))
-
-    out: set[int] = set()
-    for chunk in layers_arg.split(","):
-        chunk = chunk.strip()
-        if not chunk:
-            continue
-
-        if "-" in chunk:
-            start_text, end_text = chunk.split("-", 1)
-            start = int(start_text)
-            end = int(end_text)
-            if end < start:
-                raise ValueError(f"Invalid layer range '{chunk}': end < start.")
-            for layer_idx in range(start, end + 1):
-                out.add(layer_idx)
-        else:
-            out.add(int(chunk))
-
-    layers = sorted(out)
-    if not layers:
-        raise ValueError("No layers were parsed from --layers.")
-    if layers[0] < 0 or layers[-1] >= num_hidden_layers:
-        raise ValueError(
-            f"Layer indices must be within [0, {num_hidden_layers - 1}], got {layers}."
-        )
-    return layers
-
-
-def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Compute and cache concept vectors in data/vectors/concept_vectors.pt "
-            "for remote NDIF tracing."
-        )
-    )
-    parser.add_argument(
-        "--model",
-        default=DEFAULT_MODEL,
-        help="Hugging Face model id to use with nnsight/NDIF.",
-    )
-    parser.add_argument(
-        "--revision",
-        default=None,
-        help="Optional model revision/branch.",
-    )
-    parser.add_argument(
-        "--concepts-file",
-        type=Path,
-        default=DEFAULT_CONCEPTS_FILE,
-        help="File containing concept words (comma and/or newline separated).",
-    )
-    parser.add_argument(
-        "--baseline-file",
-        type=Path,
-        default=DEFAULT_BASELINE_FILE,
-        help="File containing baseline words (comma and/or newline separated).",
-    )
-    parser.add_argument(
-        "--layers",
-        default="all",
-        help=(
-            "Layer selection: 'all' or comma/range list such as '0-7,12,24-31'. "
-            "Default: all layers."
-        ),
-    )
-    parser.add_argument(
-        "--local",
-        action="store_true",
-        help="Run locally instead of NDIF remote execution.",
-    )
-    parser.add_argument(
-        "--max-retries",
-        type=int,
-        default=3,
-        help="How many times to retry model init / vector extraction on transient failures.",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help=(
-            "Run one scan/validate trace and print output shapes, then exit without "
-            "computing vectors."
-        ),
-    )
-    return parser
+def concept_slug(concept: str) -> str:
+    """Deterministic filename-safe slug for a concept."""
+    return re.sub(r"[^a-z0-9]+", "_", concept.lower()).strip("_")
 
 
-def run_with_retries(task_name: str, fn, max_retries: int):
-    wait_seconds = 15
-    for attempt in range(1, max_retries + 1):
-        try:
-            return fn()
-        except Exception as exc:  # noqa: BLE001
-            if attempt == max_retries:
-                raise
-            print(
-                f"[warn] {task_name} failed (attempt {attempt}/{max_retries}): {exc}\n"
-                f"[warn] Retrying in {wait_seconds}s..."
-            )
-            time.sleep(wait_seconds)
-            wait_seconds = min(wait_seconds * 2, 180)
-
-
-def _layer_envoy(model: LanguageModel, layer_idx: int):
-    if hasattr(model, "model") and hasattr(model.model, "layers"):
-        return model.model.layers[layer_idx]
-    if hasattr(model, "transformer") and hasattr(model.transformer, "h"):
-        return model.transformer.h[layer_idx]
-    raise AttributeError("Could not locate transformer layers on this LanguageModel.")
-
-
-def run_dry_run(
-    model: LanguageModel,
-    concept_word: str,
-    layer_idx: int,
-    remote: bool,
-) -> None:
-    if getattr(model, "tokenizer", None) is None:
-        raise RuntimeError("LanguageModel tokenizer is not initialized.")
-
-    messages = build_concept_prompt_messages(concept_word)
-    tokenized_prompt = tokenize_concept_prompt(model.tokenizer, messages)
-    layer_envoy = _layer_envoy(model, layer_idx)
-
-    hidden = None
-    last_token = None
-    with model.trace(remote=remote, scan=True, validate=True) as tracer:
-        with tracer.invoke(tokenized_prompt):
-            layer_hidden = layer_envoy.output[0]
-            hidden = layer_hidden.detach().cpu().save()
-            last_token = layer_hidden[..., -1, :].squeeze(0).detach().cpu().save()
-
-    if hidden is None or last_token is None:
-        raise RuntimeError("Dry-run trace did not return expected tensors.")
-
-    print(f"[dry-run] Prompt: Tell me about {concept_word}.")
-    print(f"[dry-run] Layer {layer_idx} hidden shape: {tuple(hidden.shape)}")
-    print(f"[dry-run] Layer {layer_idx} last-token shape: {tuple(last_token.shape)}")
-
-
-def main() -> None:
-    args = build_arg_parser().parse_args()
-    load_dotenv()
-
-    if not args.concepts_file.exists():
-        raise FileNotFoundError(f"Concepts file not found: {args.concepts_file}")
-    if not args.baseline_file.exists():
-        raise FileNotFoundError(f"Baseline file not found: {args.baseline_file}")
-
-    concepts = parse_word_file(args.concepts_file)
-    baseline_words = parse_word_file(args.baseline_file)
-    if not concepts:
-        raise ValueError(f"No concept words found in {args.concepts_file}.")
-    if not baseline_words:
-        raise ValueError(f"No baseline words found in {args.baseline_file}.")
-
-    # compute_concept_vectors expects unique concept keys in output dict.
-    unique_concepts = unique_preserve_order(concepts)
-    removed = len(concepts) - len(unique_concepts)
-    if removed > 0:
-        print(f"[info] Removed {removed} duplicate concept words before vectorization.")
-
-    print("[info] Initializing nnsight model wrapper...")
-    model = run_with_retries(
-        task_name="model initialization",
-        fn=lambda: LanguageModel(args.model, revision=args.revision),
-        max_retries=args.max_retries,
+def make_prompt(model, word: str) -> str:
+    """Build the chat-template prompt for Llama-3 models."""
+    messages = [{"role": "user", "content": f"Tell me about {word}."}]
+    return model.tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
     )
 
+
+def tensor_hash(t: torch.Tensor) -> str:
+    """SHA-256 of a tensor's bytes for reproducibility checks."""
+    return hashlib.sha256(t.numpy().tobytes()).hexdigest()[:16]
+
+
+def atomic_save(obj, path: Path):
+    """Save a torch tensor or JSON dict atomically (write to tmp then rename)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    os.close(fd)
     try:
-        num_hidden_layers = len(model.model.layers)
-    except Exception as exc:
-        raise RuntimeError(
-            "Could not infer number of layers from model.model.layers."
-        ) from exc
+        if isinstance(obj, torch.Tensor):
+            torch.save(obj, tmp)
+        elif isinstance(obj, dict):
+            with open(tmp, "w") as f:
+                json.dump(obj, f, indent=2)
+        else:
+            raise TypeError(f"Cannot save object of type {type(obj)}")
+        shutil.move(tmp, str(path))
+    except:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
 
-    layers = parse_layers(args.layers, num_hidden_layers)
-    remote = not args.local
 
-    print(
-        f"[info] Model: {args.model} "
-        f"(revision={args.revision or 'main'}, layers={len(layers)}, remote={remote})"
-    )
-    print(f"[info] Concepts: {len(unique_concepts)} | Baselines: {len(baseline_words)}")
+def extract_activations_from_cache(cache, num_layers: int) -> torch.Tensor:
+    """
+    Extract last-token activations from all layers:
+        cache[f'model.model.layers.{i}']["output"][0, -1, :]
+    Returns: tensor of shape [num_layers, hidden_dim]
+    """
+    return torch.stack([
+        cache[f'model.model.layers.{i}']["output"][0, -1, :]
+        for i in range(num_layers)
+    ], dim=0)
 
-    if args.dry_run:
-        print(
-            "[info] Running dry-run trace (scan=True, validate=True) on one prompt..."
-        )
-        run_with_retries(
-            task_name="dry-run validation",
-            fn=lambda: run_dry_run(
-                model=model,
-                concept_word=unique_concepts[0],
-                layer_idx=layers[0],
-                remote=remote,
-            ),
-            max_retries=args.max_retries,
-        )
-        print("[done] Dry-run completed. Exiting without computing concept vectors.")
-        return
 
-    print("[info] Starting vector extraction job...")
+def poll_backend(backend, timeout: float = POLL_TIMEOUT, interval: float = POLL_INTERVAL):
+    """Poll a non-blocking backend until the result is ready or timeout."""
     start = time.time()
+    while True:
+        result = backend()
+        if result is not None:
+            return result
+        if time.time() - start > timeout:
+            raise TimeoutError(
+                f"Backend poll timed out after {timeout}s. "
+                f"Status: {backend.job_status}"
+            )
+        time.sleep(interval)
 
-    concept_vectors = run_with_retries(
-        task_name="concept vector extraction",
-        fn=lambda: compute_concept_vectors(
-            model=model,
-            words=unique_concepts,
-            baseline_words=baseline_words,
-            layers=layers,
-            remote=remote,
-            logger=lambda message: print(f"[trace] {message}", flush=True),
-        ),
-        max_retries=args.max_retries,
-    )
 
-    elapsed = time.time() - start
-    print(f"[done] Cached concept vectors to {DEFAULT_CACHE_PATH} in {elapsed:.1f}s.")
-    print(
-        "[done] Tensor map shape summary: "
-        f"{len(concept_vectors)} layers x {len(unique_concepts)} concepts."
-    )
+# ============================================================================
+# Phase A: Baseline (sequential, blocking)
+# ============================================================================
+
+def compute_baseline_vectors(model, words: List[str] = BASELINE_WORDS) -> torch.Tensor:
+    """
+    Compute the mean baseline last-token activation vector using the given
+    words, following the exact procedure from the ground-truth code.
+
+    Returns: baseline_mean tensor of shape [num_layers, hidden_dim]
+    Saves: baseline_mean.pt and baseline_metadata.json to OUTPUT_DIR.
+    """
+    num_layers = model.config.num_hidden_layers
+    baseline_samples = []
+
+    print(f"[Phase A] Computing baseline from {len(words)} words (blocking)...")
+    t0 = time.time()
+
+    for idx, w in enumerate(words):
+        prompt = make_prompt(model, w)
+
+        with model.trace(prompt, remote=True) as tracer:
+            cache = tracer.cache(
+                modules=[layer for layer in model.model.layers]
+            ).save()
+
+        sample = extract_activations_from_cache(cache, num_layers)
+        baseline_samples.append(sample)
+
+        if (idx + 1) % 10 == 0 or (idx + 1) == len(words):
+            elapsed = time.time() - t0
+            rate = (idx + 1) / elapsed
+            print(f"  [{idx+1}/{len(words)}] {rate:.1f} words/s, elapsed {elapsed:.1f}s")
+
+    baseline_stack = torch.stack(baseline_samples, dim=0)  # [N, num_layers, hidden]
+    baseline_mean = baseline_stack.mean(dim=0)              # [num_layers, hidden]
+
+    # Save
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    atomic_save(baseline_mean, OUTPUT_DIR / "baseline_mean.pt")
+    metadata = {
+        "model": MODEL,
+        "num_words": len(words),
+        "words": words,
+        "num_layers": num_layers,
+        "hidden_dim": baseline_mean.shape[1],
+        "shape": list(baseline_mean.shape),
+        "hash": tensor_hash(baseline_mean),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    atomic_save(metadata, OUTPUT_DIR / "baseline_metadata.json")
+
+    elapsed = time.time() - t0
+    print(f"[Phase A] Baseline computed in {elapsed:.1f}s. Shape: {baseline_mean.shape}")
+    print(f"          Saved to {OUTPUT_DIR / 'baseline_mean.pt'}")
+    return baseline_mean
+
+
+def load_baseline(path: Optional[Path] = None) -> torch.Tensor:
+    """Load a previously saved baseline_mean tensor."""
+    path = path or (OUTPUT_DIR / "baseline_mean.pt")
+    assert path.exists(), f"Baseline not found at {path}"
+    return torch.load(path, weights_only=True)
+
+
+# ============================================================================
+# Phase B: Async / parallel concept vector computation
+# ============================================================================
+
+def _trace_word_blocking(model, word: str, num_layers: int) -> torch.Tensor:
+    """Run a single blocking trace for a word. Returns [num_layers, hidden]."""
+    prompt = make_prompt(model, word)
+    with model.trace(prompt, remote=True) as tracer:
+        cache = tracer.cache(
+            modules=[layer for layer in model.model.layers]
+        ).save()
+    return extract_activations_from_cache(cache, num_layers)
+
+
+
+def compute_concept_vector(
+    sample: torch.Tensor,
+    baseline_mean: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Compute the concept vector: sample - baseline_mean, per layer.
+    Both are [num_layers, hidden_dim].
+    Returns [num_layers, hidden_dim].
+    """
+    return sample - baseline_mean
+
+
+def save_concept_vector(
+    concept: str,
+    concept_vector: torch.Tensor,
+    raw_sample: torch.Tensor,
+    baseline_hash: str,
+):
+    """Save a concept vector and its metadata atomically."""
+    slug = concept_slug(concept)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Save the full [num_layers, hidden] concept vector
+    vec_path = OUTPUT_DIR / f"{slug}_all_layers.pt"
+    atomic_save(concept_vector, vec_path)
+
+    # Save metadata
+    meta = {
+        "concept": concept,
+        "slug": slug,
+        "model": MODEL,
+        "shape": list(concept_vector.shape),
+        "hash": tensor_hash(concept_vector),
+        "raw_sample_hash": tensor_hash(raw_sample),
+        "baseline_hash": baseline_hash,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    atomic_save(meta, OUTPUT_DIR / f"{slug}_metadata.json")
+    return vec_path
+
+
+def concept_already_on_disk(concept: str) -> bool:
+    """Check if a concept vector already exists on disk."""
+    slug = concept_slug(concept)
+    vec_path = OUTPUT_DIR / f"{slug}_all_layers.pt"
+    meta_path = OUTPUT_DIR / f"{slug}_metadata.json"
+    return vec_path.exists() and meta_path.exists()
+
+
+def compute_all_vectors_async(
+    model,
+    concepts: List[str],
+    baseline_mean: torch.Tensor,
+    max_in_flight: int = MAX_IN_FLIGHT,
+):
+    """
+    Phase B: Compute all concept vectors using non-blocking remote traces
+    with bounded concurrency.
+
+    Uses blocking=False on model.trace() to submit multiple traces in parallel,
+    then polls for results. A threading semaphore limits concurrency to
+    max_in_flight simultaneous requests.
+    """
+    num_layers = model.config.num_hidden_layers
+    baseline_hash = tensor_hash(baseline_mean)
+
+    # Filter concepts
+    if OVERWRITE:
+        to_compute = concepts
+    else:
+        to_compute = [c for c in concepts if not concept_already_on_disk(c)]
+        skipped = len(concepts) - len(to_compute)
+        if skipped:
+            print(f"[Phase B] Skipping {skipped} concepts already on disk (OVERWRITE=False)")
+
+    if not to_compute:
+        print("[Phase B] Nothing to compute.")
+        return []
+
+    print(f"[Phase B] Computing {len(to_compute)} concept vectors "
+          f"(max_in_flight={max_in_flight})...")
+    t0 = time.time()
+
+    failures = []
+    completed_count = [0]  # mutable counter for thread safety
+    lock = threading.Lock()
+
+    def process_concept(concept: str) -> Optional[str]:
+        """Submit non-blocking trace, poll, compute, and save. Returns error or None."""
+        try:
+            # Submit non-blocking trace (returns immediately)
+            prompt = make_prompt(model, concept)
+            with model.trace(prompt, remote=True, blocking=False) as tracer:
+                cache = tracer.cache(
+                    modules=[layer for layer in model.model.layers]
+                ).save()
+            backend = tracer.backend
+
+            # Poll for result (blocks this thread until NDIF job completes)
+            poll_backend(backend)
+
+            # Extract activations (identical to ground truth)
+            sample = extract_activations_from_cache(cache, num_layers)
+
+            # Compute concept vector: sample - baseline_mean
+            cvec = compute_concept_vector(sample, baseline_mean)
+
+            # Save atomically
+            save_concept_vector(concept, cvec, sample, baseline_hash)
+
+            with lock:
+                completed_count[0] += 1
+                n_done = completed_count[0]
+            elapsed = time.time() - t0
+            print(f"  [{n_done}/{len(to_compute)}] '{concept}' done "
+                  f"({elapsed:.1f}s elapsed)")
+            return None
+
+        except Exception as e:
+            err = f"'{concept}': {type(e).__name__}: {e}"
+            print(f"  [ERROR] {err}")
+            raise
+
+    # ThreadPoolExecutor limits concurrency to max_in_flight workers.
+    # Each worker submits one non-blocking trace, then polls until complete.
+    with ThreadPoolExecutor(max_workers=max_in_flight) as executor:
+        futures = {
+            executor.submit(process_concept, c): c
+            for c in to_compute
+        }
+        for future in as_completed(futures):
+            err = future.result()
+            if err:
+                failures.append(err)
+
+    elapsed = time.time() - t0
+    print(f"[Phase B] Completed {completed}/{len(to_compute)} in {elapsed:.1f}s")
+    if failures:
+        print(f"[Phase B] {len(failures)} failures:")
+        for f in failures:
+            print(f"  - {f}")
+
+    return failures
+
+
+# ============================================================================
+# Verification
+# ============================================================================
+
+def verify_against_baseline(
+    model,
+    baseline_mean: torch.Tensor,
+    n: int = VERIFY_N,
+    atol: float = ATOL,
+    cos_min: float = COS_MIN,
+):
+    """
+    Verify that the async pipeline produces identical results to the blocking
+    baseline for a small set of concepts.
+    """
+    verify_concepts = CONCEPTS[:n]
+    num_layers = model.config.num_hidden_layers
+    baseline_hash = tensor_hash(baseline_mean)
+
+    print(f"\n[Verify] Checking {len(verify_concepts)} concepts...")
+
+    all_pass = True
+
+    for concept in verify_concepts:
+        # Method 1: Blocking (ground-truth equivalent)
+        sample_blocking = _trace_word_blocking(model, concept, num_layers)
+        vec_blocking = compute_concept_vector(sample_blocking, baseline_mean)
+
+        # Method 2: Load from disk (computed by Phase B async)
+        slug = concept_slug(concept)
+        disk_path = OUTPUT_DIR / f"{slug}_all_layers.pt"
+
+        if not disk_path.exists():
+            print(f"  '{concept}': SKIP (not on disk)")
+            continue
+
+        vec_async = torch.load(disk_path, weights_only=True)
+
+        # Check absolute difference
+        max_diff = (vec_blocking - vec_async).abs().max().item()
+
+        # Check cosine similarity (flatten to 1D for cos sim)
+        cos_sim = torch.nn.functional.cosine_similarity(
+            vec_blocking.flatten().unsqueeze(0),
+            vec_async.flatten().unsqueeze(0),
+        ).item()
+
+        passed = max_diff <= atol and cos_sim >= cos_min
+        status = "PASS" if passed else "FAIL"
+        if not passed:
+            all_pass = False
+
+        print(f"  '{concept}': {status} "
+              f"(max_diff={max_diff:.2e}, cos_sim={cos_sim:.8f})")
+
+    if all_pass:
+        print("[Verify] All checks passed!")
+    else:
+        print("[Verify] Some checks FAILED — investigate differences.")
+
+    return all_pass
+
+
+# ============================================================================
+# Main
+# ============================================================================
+
+def main():
+    print("=" * 70)
+    print("Concept Vector Extraction (Lindsey et al.)")
+    print(f"  Model: {MODEL}")
+    print(f"  Output: {OUTPUT_DIR}")
+    print(f"  Baseline words: {len(BASELINE_WORDS)}")
+    print(f"  Concepts: {len(CONCEPT_LIST)}")
+    print(f"  Max in-flight: {MAX_IN_FLIGHT}")
+    print(f"  Overwrite: {OVERWRITE}")
+    print("=" * 70)
+
+    # Check NDIF is available
+    assert nnsight.is_model_running(MODEL), f"{MODEL} is not online on NDIF."
+    print(f"Model {MODEL} is online.")
+
+    # Load model (lazy — no weights downloaded locally)
+    model = nnsight.LanguageModel(MODEL)
+    print(f"Model loaded. Layers: {model.config.num_hidden_layers}")
+
+    # --- Phase A: Baseline ---
+    baseline_path = OUTPUT_DIR / "baseline_mean.pt"
+    if baseline_path.exists() and not OVERWRITE:
+        print(f"\n[Phase A] Loading existing baseline from {baseline_path}")
+        baseline_mean = load_baseline(baseline_path)
+        print(f"          Shape: {baseline_mean.shape}, hash: {tensor_hash(baseline_mean)}")
+    else:
+        print()
+        baseline_mean = compute_baseline_vectors(model)
+
+    # --- Phase B: All concept vectors (async) ---
+    print()
+    failures = compute_all_vectors_async(model, CONCEPT_LIST, baseline_mean) or []
+
+    # --- Verification ---
+    verify_against_baseline(model, baseline_mean)
+
+    print("\nDone.")
+    if failures:
+        print(f"WARNING: {len(failures)} concept(s) failed. See above.")
 
 
 if __name__ == "__main__":
