@@ -104,7 +104,7 @@ def configure_ndif_api_key() -> str:
         raise RuntimeError(
             "NDIF_API_KEY was not found. Add it to your environment or .env file."
         )
-    nnsight.CONFIG.set_default_api_key(api_key)
+    nnsight.CONFIG.set_default_api_key(api_key) # type: ignore
     return api_key
 
 

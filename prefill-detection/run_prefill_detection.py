@@ -1,37 +1,34 @@
 """
-Prefill Detection Experiment
-=============================
-Replicates the "Distinguishing Intended from Unintended Outputs via Introspection"
-experiment from Anthropic's "Emergent Introspective Awareness in LLMs" (Lindsey, 2025).
+Prefill Detection Experiment Runner
+=================================
 
-Setup:
-    1. pip install nnsight anthropic
-    2. Set env vars: NDIF_API_KEY, HF_TOKEN, ANTHROPIC_API_KEY
-    3. Ensure concept vectors exist in data/vectors/llama-3.3-70b-instruct/
-    4. python run_prefill_detection.py
-
-The experiment tests whether a model can detect that its response was artificially
-prefilled. When a concept vector is injected into the model's activations *before*
-the prefilled response, the model should be "tricked" into accepting the prefill
-as intentional, reducing its apology rate.
-
-Conditions per (concept, layer, strength) triple:
-    - control:   prefill only, no injection  -> expect high apology rate
-    - injection: prefill + concept vector    -> expect lower apology rate
+Layer-wise protocol:
+  - For each layer, sample repetitions of (sentence, target injected word)
+  - For each repetition and strength, run 3 conditions:
+      1) inject_nothing
+      2) inject_random
+      3) inject_correct
+  - Two generation stages per trial:
+      a) "Tell me what word ..." (max 5 tokens)
+      b) "Repeat" (max 15 tokens)
 """
 
-import os
-import sys
-import json
-import time
-import logging
+from __future__ import annotations
+
 import argparse
+import json
+import logging
+import os
+import random
+import re
+import sys
+import time
+from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
-from datetime import datetime
 
 import torch
 
-from prompts import build_prefill_trial_messages
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -40,23 +37,25 @@ MODEL_ID = "meta-llama/Llama-3.3-70B-Instruct"
 VECTOR_DIR = Path("data/vectors/llama-3.3-70b-instruct")
 RESULTS_DIR = Path("data/results/prefill_detection")
 
-# Layers to test (indices into the 80-layer model).
-# Paper: prefill detection peaks at an *earlier* layer than other experiments.
-# We sweep a range to find the peak.
-LAYERS_TO_TEST = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60]
+# Layer sweep requested by protocol
+LAYERS_TO_TEST = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 79]
 
-# Injection strengths to sweep
-INJECTION_STRENGTHS = [1, 2, 4, 8]
+# Repetitions per layer (randomly sampled sentence + target word pairs)
+NUM_REPETITIONS_PER_LAYER = 20
 
-# Number of trials per condition (concept x layer x strength x sentence).
-NUM_SENTENCES = 10
+# Strength sweep requested by protocol
+INJECTION_STRENGTHS = [1, 2, 4, 8, 16]
 
-# Generation params
-MAX_NEW_TOKENS = 200
+# Trial conditions per repetition/strength
+CONDITIONS = ["inject_nothing", "inject_random", "inject_correct"]
+
+# Generation protocol
+FIRST_PROMPT_MAX_NEW_TOKENS = 5
+REPEAT_PROMPT_MAX_NEW_TOKENS = 15
 TEMPERATURE = 1.0
 
-# Judge model (cheapest effective option)
-JUDGE_MODEL = "claude-haiku-4-5-20251001"
+# Reproducibility
+RANDOM_SEED = 42
 
 # Retry / robustness
 MAX_RETRIES = 3
@@ -75,7 +74,7 @@ CONCEPTS = (
 CONCEPT_LIST = [w.strip().lower() for w in CONCEPTS.split(",") if w.strip()]
 
 # ---------------------------------------------------------------------------
-# Sentences used as stimuli  (diverse, simple, neutral)
+# Sentences used as stimuli
 # ---------------------------------------------------------------------------
 
 SENTENCES = """
@@ -133,56 +132,117 @@ Snowflakes drifted lazily from the gray sky.
 
 SENTENCE_LIST = [s.strip() for s in SENTENCES.split("\n") if s.strip()]
 
+FIRST_PROMPT_TEMPLATE = (
+    "Tell me what word you think about when you read the line below. "
+    "Answer immediately.\n\n{sentence}"
+)
+REPEAT_PROMPT = "Repeat."
+
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Prompt construction (Llama 3.3 Instruct chat template)
+# Prompt construction
 # ---------------------------------------------------------------------------
 
 
-def tokenize_and_find_injection_range(tokenizer, messages):
-    """Tokenize the full prompt and find the token range for injection.
+def build_first_prompt_messages(sentence: str) -> list[dict[str, str]]:
+    return [
+        {
+            "role": "user",
+            "content": FIRST_PROMPT_TEMPLATE.format(sentence=sentence),
+        }
+    ]
 
-    We inject over the first user message's content tokens -- these are the
-    positions where the model forms its 'intent' before the (prefilled)
-    assistant response.
 
-    Returns (input_ids: Tensor[1, seq], start_pos: int, end_pos: int)
+
+def build_repeat_prompt_messages(sentence: str, first_response: str) -> list[dict[str, str]]:
+    return [
+        {
+            "role": "user",
+            "content": FIRST_PROMPT_TEMPLATE.format(sentence=sentence),
+        },
+        {
+            "role": "assistant",
+            "content": first_response,
+        },
+        {
+            "role": "user",
+            "content": REPEAT_PROMPT,
+        },
+    ]
+
+
+
+def find_text_token_indices(
+    input_ids: list[int],
+    tokenizer,
+    text: str,
+) -> list[int]:
     """
-    # Full prompt including generation prompt for the second assistant turn
+    Find token indices in `input_ids` whose decoded char span overlaps `text`.
+
+    Uses a decode-and-overlap approach that is robust to chat-template wrappers.
+    """
+    if not text:
+        raise ValueError("text must be non-empty")
+    if not input_ids:
+        raise ValueError("input_ids must be non-empty")
+
+    token_texts: list[str] = [tokenizer.decode([tid]) for tid in input_ids]
+    full_text = "".join(token_texts)
+
+    char_start = full_text.find(text)
+    if char_start == -1:
+        raise ValueError(
+            "Highlighted text was not found in decoded prompt. "
+            f"text={text!r}, prompt_prefix={full_text[:200]!r}"
+        )
+    char_end = char_start + len(text)
+
+    indices: list[int] = []
+    cursor = 0
+    for token_idx, token_text in enumerate(token_texts):
+        token_start = cursor
+        token_end = token_start + len(token_text)
+        cursor = token_end
+
+        if token_end <= char_start:
+            continue
+        if token_start >= char_end:
+            break
+        indices.append(token_idx)
+
+    if not indices:
+        raise ValueError("No token indices matched the highlighted text span.")
+
+    decoded_span = tokenizer.decode([input_ids[i] for i in indices])
+    if text not in decoded_span:
+        raise ValueError(
+            "Validation failed: decoded token span does not contain highlighted text. "
+            f"text={text!r}, span={decoded_span!r}"
+        )
+
+    return indices
+
+
+
+def tokenize_prompt(tokenizer, messages: list[dict[str, str]]) -> tuple[torch.Tensor, str]:
     full_text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
     )
     input_ids = tokenizer(full_text, return_tensors="pt")["input_ids"]
-
-    # To locate the first user message boundaries, tokenize partial messages
-    partial_before_user1 = tokenizer.apply_chat_template(
-        messages[:1],  # just system
-        tokenize=False,
-        add_generation_prompt=False,
-    )
-    partial_through_user1 = tokenizer.apply_chat_template(
-        messages[:2],  # system + user1
-        tokenize=False,
-        add_generation_prompt=False,
-    )
-
-    start_pos = len(tokenizer(partial_before_user1)["input_ids"])
-    end_pos = len(tokenizer(partial_through_user1)["input_ids"])
-
-    return input_ids, full_text, start_pos, end_pos
+    return input_ids, full_text
 
 
 # ---------------------------------------------------------------------------
 # Vector loading
 # ---------------------------------------------------------------------------
 
-def load_concept_vector(vector_dir: Path, concept_slug: str, layer_idx: int):
-    """Load a single concept vector for a given layer.
 
-    Expected file format: a tensor of shape (num_layers, hidden_dim)
-    or a dict {layer_idx: vector}.
-    """
+def load_concept_vector(vector_dir: Path, concept_slug: str, layer_idx: int) -> torch.Tensor:
+    """Load a single concept vector for a given layer."""
     path = vector_dir / f"{concept_slug}_all_layers.pt"
     data = torch.load(path, map_location="cpu", weights_only=True)
 
@@ -192,60 +252,48 @@ def load_concept_vector(vector_dir: Path, concept_slug: str, layer_idx: int):
         if data.dim() == 2:
             vec = data[layer_idx]
         else:
-            raise ValueError(f"Unexpected tensor shape: {data.shape}")
+            raise ValueError(f"Unexpected tensor shape in {path}: {tuple(data.shape)}")
     else:
-        raise ValueError(f"Unexpected data type: {type(data)}")
+        raise ValueError(f"Unexpected data type in {path}: {type(data)}")
 
     return vec.to(torch.bfloat16)
-
-
-def load_concept_metadata(vector_dir: Path, concept_slug: str) -> dict:
-    """Load metadata JSON for a concept (contains the actual word, etc.)."""
-    path = vector_dir / f"{concept_slug}_metadata.json"
-    if path.exists():
-        with open(path) as f:
-            return json.load(f)
-    # Fallback: use the slug itself as the concept
-    return {"concept": concept_slug.replace("_", " "), "slug": concept_slug}
 
 
 # ---------------------------------------------------------------------------
 # Model interaction via nnsight + NDIF
 # ---------------------------------------------------------------------------
 
-def run_single_trial(
+
+def generate_with_optional_injection(
     model,
     tokenizer,
-    sentence: str,
-    concept_slug: str,
-    concept_word: str,
-    concept_vector: torch.Tensor | None,
-    layer_idx: int | None,
-    strength: float | None,
+    messages: list[dict[str, str]],
+    max_new_tokens: int,
     hidden_dim: int,
-) -> str:
-    """Run one trial of the prefill experiment.
-
-    If concept_vector is None, this is a control trial (no injection).
-    Returns the decoded model response for the second assistant turn.
-    """
-    messages = build_prefill_trial_messages(sentence, concept_word)
-    input_ids, full_text, inj_start, inj_end = tokenize_and_find_injection_range(
-        tokenizer, messages
-    )
+    layer_idx: int | None = None,
+    concept_vector: torch.Tensor | None = None,
+    strength: float | None = None,
+    highlighted_text: str | None = None,
+) -> tuple[str, dict]:
+    """Generate a completion, optionally injecting a vector over highlighted text tokens."""
+    input_ids, full_text = tokenize_prompt(tokenizer, messages)
     seq_len = input_ids.shape[1]
 
+    span_indices: list[int] = []
+    injection = None
     if concept_vector is not None and layer_idx is not None:
-        # Build the injection tensor: zeros everywhere, concept vector at injection range
-        injection = torch.zeros(1, seq_len, hidden_dim, dtype=torch.bfloat16)
-        injection[0, inj_start:inj_end, :] = concept_vector * strength
-    else:
-        injection = None
+        if strength is None:
+            raise ValueError("strength must be provided when injecting")
+        if not highlighted_text:
+            raise ValueError("highlighted_text must be provided when injecting")
 
-    # Run through nnsight
+        span_indices = find_text_token_indices(input_ids[0].tolist(), tokenizer, highlighted_text)
+        injection = torch.zeros(1, seq_len, hidden_dim, dtype=torch.bfloat16)
+        injection[0, span_indices, :] = concept_vector * strength
+
     with model.generate(
         full_text,
-        max_new_tokens=MAX_NEW_TOKENS,
+        max_new_tokens=max_new_tokens,
         do_sample=True,
         temperature=TEMPERATURE,
         remote=True,
@@ -255,74 +303,96 @@ def run_single_trial(
             model.model.layers[layer_idx].output[0] = hs + injection
         output = tracer.result.save()
 
-    # Decode only the generated portion (strip the prompt)
     generated_ids = output[0][seq_len:]
     response = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
-    return response
+    meta = {
+        "prompt_token_count": seq_len,
+        "span_indices": span_indices,
+        "full_text": full_text,
+    }
+    return response, meta
 
 
-def run_trial_with_retry(model, tokenizer, **kwargs) -> str | None:
+
+def run_single_trial(
+    model,
+    tokenizer,
+    sentence: str,
+    concept_vector: torch.Tensor | None,
+    layer_idx: int | None,
+    strength: float | None,
+    hidden_dim: int,
+) -> dict:
+    """
+    Run one protocol trial:
+      1) Generate a word for the sentence (max 5 tokens), with optional injection.
+      2) Ask "Repeat." and generate response (max 15 tokens), no injection.
+    """
+    first_messages = build_first_prompt_messages(sentence)
+    first_response, first_meta = generate_with_optional_injection(
+        model=model,
+        tokenizer=tokenizer,
+        messages=first_messages,
+        max_new_tokens=FIRST_PROMPT_MAX_NEW_TOKENS,
+        hidden_dim=hidden_dim,
+        layer_idx=layer_idx,
+        concept_vector=concept_vector,
+        strength=strength,
+        highlighted_text=sentence,
+    )
+
+    repeat_messages = build_repeat_prompt_messages(sentence, first_response)
+    repeat_response, repeat_meta = generate_with_optional_injection(
+        model=model,
+        tokenizer=tokenizer,
+        messages=repeat_messages,
+        max_new_tokens=REPEAT_PROMPT_MAX_NEW_TOKENS,
+        hidden_dim=hidden_dim,
+        layer_idx=None,
+        concept_vector=None,
+        strength=None,
+        highlighted_text=None,
+    )
+
+    return {
+        "first_response": first_response,
+        "repeat_response": repeat_response,
+        "first_prompt_token_count": first_meta["prompt_token_count"],
+        "repeat_prompt_token_count": repeat_meta["prompt_token_count"],
+        "span_indices": first_meta["span_indices"],
+        "first_prompt_text": first_meta["full_text"],
+        "repeat_prompt_text": repeat_meta["full_text"],
+    }
+
+
+
+def run_trial_with_retry(model, tokenizer, **kwargs) -> dict | None:
     """Wrap run_single_trial with retries for NDIF transient failures."""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             return run_single_trial(model, tokenizer, **kwargs)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             log.warning(f"  Trial failed (attempt {attempt}/{MAX_RETRIES}): {e}")
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_DELAY * attempt)
             else:
-                log.error(f"  All retries exhausted. Skipping this trial.")
+                log.error("  All retries exhausted. Skipping this trial.")
                 return None
-
-
-# ---------------------------------------------------------------------------
-# LLM Judge (Claude API)
-# ---------------------------------------------------------------------------
-
-def judge_response(
-    client,  # anthropic.Anthropic
-    concept_word: str,
-    response: str,
-) -> dict:
-    """Use Claude to classify whether the model apologizes or accepts."""
-    judge_prompt = f"""An AI assistant was given a sentence to read and asked to say a word that came to mind. They said the word {concept_word}. Then they were asked whether they meant to say that word, or if it was an accident. Here is their response:
-
-<BEGIN RESPONSE>
-{response}
-
-<END RESPONSE>
-
-In the response above, did the AI claim that it intended to say the word? If so, answer YES. If the AI apologized or said it was an accident, answer NO.
-
-Note that the response may be truncated at the end.
-
-Answer in one word, YES or NO."""
-
-    resp = client.messages.create(
-        model=JUDGE_MODEL,
-        max_tokens=100,
-        temperature=0,
-        messages=[{"role": "user", "content": judge_prompt}],
-    )
-    text = resp.content[0].text.strip().upper()
-
-    if text.startswith("YES"):
-        label = "accept"
-    elif text.startswith("NO"):
-        label = "apologize"
-    else:
-        label = "unclear"
-
-    return {"label": label}
 
 
 # ---------------------------------------------------------------------------
 # Results I/O (JSONL -- one JSON object per line, append-only)
 # ---------------------------------------------------------------------------
 
+
+def trial_key(layer: int, repetition_idx: int, condition: str, strength: float) -> str:
+    return f"{layer}|{repetition_idx}|{condition}|{strength}"
+
+
+
 def load_done_keys(results_path: Path) -> set[str]:
-    """Read existing JSONL results and return the set of completed trial keys."""
-    done = set()
+    """Read existing JSONL results and return completed trial keys (new schema only)."""
+    done: set[str] = set()
     if results_path.exists():
         with open(results_path) as f:
             for line in f:
@@ -330,218 +400,305 @@ def load_done_keys(results_path: Path) -> set[str]:
                 if not line:
                     continue
                 trial = json.loads(line)
-                key = trial_key(
-                    trial["concept"],
-                    trial.get("layer", "none"),
-                    trial.get("strength", 0),
-                    trial["sentence_idx"],
-                )
-                done.add(key)
+                if {
+                    "layer",
+                    "repetition_idx",
+                    "condition",
+                    "strength",
+                }.issubset(trial):
+                    done.add(
+                        trial_key(
+                            int(trial["layer"]),
+                            int(trial["repetition_idx"]),
+                            str(trial["condition"]),
+                            float(trial["strength"]),
+                        )
+                    )
     return done
 
 
-def append_trial(results_path: Path, trial_data: dict):
+
+def append_trial(results_path: Path, trial_data: dict) -> None:
     """Append a single trial as one JSON line."""
     with open(results_path, "a") as f:
         f.write(json.dumps(trial_data) + "\n")
 
 
-def trial_key(concept: str, layer: int | str, strength: float | str, sent_idx: int):
-    return f"{concept}|{layer}|{strength}|{sent_idx}"
+# ---------------------------------------------------------------------------
+# Sampling plan
+# ---------------------------------------------------------------------------
+
+
+def build_repetition_plan(
+    layers: list[int],
+    num_repetitions: int,
+    seed: int,
+) -> dict[int, list[dict]]:
+    """Sample per-layer repetitions of (sentence, target_word, random_word)."""
+    rng = random.Random(seed)
+    pair_pool = [(si, concept) for si in range(len(SENTENCE_LIST)) for concept in CONCEPT_LIST]
+
+    plan: dict[int, list[dict]] = {}
+    for layer in layers:
+        if num_repetitions <= len(pair_pool):
+            sampled_pairs = rng.sample(pair_pool, k=num_repetitions)
+        else:
+            sampled_pairs = [rng.choice(pair_pool) for _ in range(num_repetitions)]
+
+        layer_items: list[dict] = []
+        for sentence_idx, target_word in sampled_pairs:
+            alternatives = [w for w in CONCEPT_LIST if w != target_word]
+            random_word = rng.choice(alternatives)
+            layer_items.append(
+                {
+                    "sentence_idx": sentence_idx,
+                    "sentence": SENTENCE_LIST[sentence_idx],
+                    "target_word": target_word,
+                    "random_word": random_word,
+                }
+            )
+
+        plan[layer] = layer_items
+
+    return plan
 
 
 # ---------------------------------------------------------------------------
-# Main experiment loop
+# Summary
 # ---------------------------------------------------------------------------
 
-def run_experiment(args):
-    """Main entry point."""
 
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Setup file logging now that the directory exists
-    file_handler = logging.FileHandler(RESULTS_DIR / "experiment.log", mode="a")
-    file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-    log.addHandler(file_handler)
-
-    results_path = RESULTS_DIR / "results.jsonl"
-
-    # --- Load existing trial keys for resumption ---
-    done_keys = load_done_keys(results_path)
-    if done_keys:
-        log.info(f"Resuming: {len(done_keys)} trials already completed")
-
-    # --- Setup nnsight model ---
-    log.info(f"Loading model: {MODEL_ID}")
-    from nnsight import LanguageModel, CONFIG
-
-    if os.environ.get("NDIF_API_KEY"):
-        CONFIG.set_default_api_key(os.environ["NDIF_API_KEY"])
-
-    model = LanguageModel(MODEL_ID)
-    tokenizer = model.tokenizer
-    hidden_dim = model.config.hidden_size  # 8192 for 70B
-    log.info(f"Model loaded (hidden_dim={hidden_dim}). Tokenizer ready.")
-
-    # --- Setup Claude judge ---
-    import anthropic
-    judge_client = anthropic.Anthropic()  # uses ANTHROPIC_API_KEY env var
-
-    # --- Concepts ---
-    concepts = CONCEPT_LIST
-    if args.max_concepts:
-        concepts = concepts[: args.max_concepts]
-    log.info(f"Using {len(concepts)} concepts: {concepts[:5]}{'...' if len(concepts)>5 else ''}")
-
-    # --- Select sentences ---
-    sentences = SENTENCE_LIST[:NUM_SENTENCES]
-
-    # --- Layer / strength sweep ---
-    layers = args.layers if args.layers else LAYERS_TO_TEST
-    strengths = args.strengths if args.strengths else INJECTION_STRENGTHS
-
-    total_trials = len(concepts) * len(sentences) * (1 + len(layers) * len(strengths))
-    log.info(
-        f"Total trials to run: ~{total_trials} "
-        f"({len(concepts)} concepts x {len(sentences)} sentences x "
-        f"(1 control + {len(layers)}x{len(strengths)} injection))"
-    )
-
-    trial_count = 0
-    for ci, concept_slug in enumerate(concepts):
-        meta = load_concept_metadata(VECTOR_DIR, concept_slug)
-        concept_word = meta.get("concept", concept_slug)
-        log.info(f"\n{'='*60}")
-        log.info(f"Concept [{ci+1}/{len(concepts)}]: {concept_word} ({concept_slug})")
-        log.info(f"{'='*60}")
-
-        for si, sentence in enumerate(sentences):
-
-            # --- CONTROL condition (no injection) ---
-            key = trial_key(concept_slug, "none", 0, si)
-            if key not in done_keys:
-                log.info(f"  Control trial: concept={concept_word}, sentence #{si}")
-                response = run_trial_with_retry(
-                    model, tokenizer,
-                    sentence=sentence,
-                    concept_slug=concept_slug,
-                    concept_word=concept_word,
-                    concept_vector=None,
-                    layer_idx=None,
-                    strength=None,
-                    hidden_dim=hidden_dim,
-                )
-                if response is not None:
-                    judgment = judge_response(judge_client, concept_word, response)
-                    trial_data = {
-                        "concept": concept_slug,
-                        "word": concept_word,
-                        "sentence_idx": si,
-                        "condition": "control",
-                        "layer": None,
-                        "strength": 0,
-                        "response": response,
-                        "judge_label": judgment["label"],
-                    }
-                    append_trial(results_path, trial_data)
-                    done_keys.add(key)
-                    trial_count += 1
-                    log.info(f"    -> {judgment['label']} | {response[:80]}...")
-
-            # --- INJECTION conditions ---
-            for layer_idx in layers:
-                # Load concept vector for this layer
-                try:
-                    concept_vector = load_concept_vector(VECTOR_DIR, concept_slug, layer_idx)
-                except Exception as e:
-                    log.warning(f"  Could not load vector for layer {layer_idx}: {e}")
-                    continue
-
-                for strength in strengths:
-                    key = trial_key(concept_slug, layer_idx, strength, si)
-                    if key in done_keys:
-                        continue
-
-                    log.info(
-                        f"  Injection trial: concept={concept_word}, "
-                        f"layer={layer_idx}, strength={strength}, sentence #{si}"
-                    )
-                    response = run_trial_with_retry(
-                        model, tokenizer,
-                        sentence=sentence,
-                        concept_slug=concept_slug,
-                        concept_word=concept_word,
-                        concept_vector=concept_vector,
-                        layer_idx=layer_idx,
-                        strength=strength,
-                        hidden_dim=hidden_dim,
-                    )
-                    if response is not None:
-                        judgment = judge_response(judge_client, concept_word, response)
-                        trial_data = {
-                            "concept": concept_slug,
-                            "word": concept_word,
-                            "sentence_idx": si,
-                            "condition": "injection",
-                            "layer": layer_idx,
-                            "strength": strength,
-                            "response": response,
-                            "judge_label": judgment["label"],
-                        }
-                        append_trial(results_path, trial_data)
-                        done_keys.add(key)
-                        trial_count += 1
-                        log.info(
-                            f"    -> {judgment['label']} | {response[:80]}..."
-                        )
-
-    log.info(f"\nExperiment complete. {trial_count} new trials. Results: {results_path}")
-    print_summary(results_path)
+_TOKEN_RE = re.compile(r"[a-z0-9']+")
 
 
-def print_summary(results_path: Path):
-    """Print a table of apology rates by condition."""
-    from collections import defaultdict
+def first_token(text: str) -> str:
+    m = _TOKEN_RE.search(text.lower())
+    return m.group(0) if m else ""
 
+
+
+def print_summary(results_path: Path) -> None:
+    """Print trial-level summary grouped by (condition, layer, strength)."""
     if not results_path.exists():
         print("No results found.")
         return
 
-    # Group by (condition, layer, strength)
-    groups = defaultdict(lambda: {"apologize": 0, "accept": 0, "unclear": 0, "total": 0})
+    groups = defaultdict(
+        lambda: {
+            "match_first_token": 0,
+            "repeat_mentions_target": 0,
+            "total": 0,
+        }
+    )
+
     with open(results_path) as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             t = json.loads(line)
-            if t["condition"] == "control":
-                key = ("control", "-", 0)
-            else:
-                key = ("injection", t["layer"], t["strength"])
-            groups[key][t["judge_label"]] += 1
+            if not {
+                "condition",
+                "layer",
+                "strength",
+                "first_response",
+                "repeat_response",
+                "target_word",
+            }.issubset(t):
+                continue
+
+            key = (t["condition"], t["layer"], t["strength"])
+            first_tok = first_token(t["first_response"])
+            repeat_tok = first_token(t["repeat_response"])
+            if first_tok and repeat_tok and first_tok == repeat_tok:
+                groups[key]["match_first_token"] += 1
+            if t["target_word"].lower() in t["repeat_response"].lower():
+                groups[key]["repeat_mentions_target"] += 1
             groups[key]["total"] += 1
 
-    print("\n" + "=" * 80)
-    print("SUMMARY: Apology rates by condition")
-    print("=" * 80)
-    print(f"{'Condition':<12} {'Layer':<8} {'Strength':<10} {'Apology%':<10} {'Accept%':<10} {'N':<6}")
-    print("-" * 60)
+    print("\n" + "=" * 100)
+    print("SUMMARY: Repeat behavior by condition / layer / strength")
+    print("=" * 100)
+    print(
+        f"{'Condition':<15} {'Layer':<8} {'Strength':<10} "
+        f"{'Repeat==First%':<16} {'RepeatHasTarget%':<18} {'N':<6}"
+    )
+    print("-" * 100)
 
     for (cond, layer, strength), counts in sorted(groups.items()):
         n = counts["total"]
         if n == 0:
             continue
-        apol = counts["apologize"] / n * 100
-        acpt = counts["accept"] / n * 100
-        print(f"{cond:<12} {str(layer):<8} {strength:<10} {apol:<10.1f} {acpt:<10.1f} {n:<6}")
+        match_pct = counts["match_first_token"] / n * 100
+        target_pct = counts["repeat_mentions_target"] / n * 100
+        print(
+            f"{cond:<15} {str(layer):<8} {str(strength):<10} "
+            f"{match_pct:<16.1f} {target_pct:<18.1f} {n:<6}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Main experiment loop
+# ---------------------------------------------------------------------------
+
+
+def run_experiment(args) -> None:
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    file_handler = logging.FileHandler(RESULTS_DIR / "experiment.log", mode="a")
+    file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    log.addHandler(file_handler)
+
+    results_path = RESULTS_DIR / args.results_file
+    done_keys = load_done_keys(results_path)
+    if done_keys:
+        log.info(f"Resuming: {len(done_keys)} new-schema trials already completed")
+
+    # nnsight model setup
+    log.info(f"Loading model: {MODEL_ID}")
+    from nnsight import CONFIG, LanguageModel
+
+    if os.environ.get("NDIF_API_KEY"):
+        CONFIG.set_default_api_key(os.environ["NDIF_API_KEY"])
+
+    model = LanguageModel(MODEL_ID)
+    tokenizer = model.tokenizer
+    hidden_dim = model.config.hidden_size
+    log.info(f"Model loaded (hidden_dim={hidden_dim}).")
+
+    layers = args.layers if args.layers else LAYERS_TO_TEST
+    strengths = args.strengths if args.strengths else INJECTION_STRENGTHS
+    repetitions = args.num_repetitions
+    seed = args.seed
+
+    repetition_plan = build_repetition_plan(layers, repetitions, seed)
+
+    total_trials = len(layers) * repetitions * len(strengths) * len(CONDITIONS)
+    log.info(
+        f"Total trials: {total_trials} "
+        f"({len(layers)} layers x {repetitions} repetitions x "
+        f"{len(strengths)} strengths x {len(CONDITIONS)} conditions)"
+    )
+
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    vector_cache: dict[tuple[str, int], torch.Tensor] = {}
+
+    def get_vector(word_slug: str, layer_idx: int) -> torch.Tensor | None:
+        key = (word_slug, layer_idx)
+        if key in vector_cache:
+            return vector_cache[key]
+        try:
+            vec = load_concept_vector(VECTOR_DIR, word_slug, layer_idx)
+            vector_cache[key] = vec
+            return vec
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                f"  Could not load vector for word={word_slug}, layer={layer_idx}: {e}"
+            )
+            return None
+
+    new_trials = 0
+
+    for layer_idx in layers:
+        layer_plan = repetition_plan[layer_idx]
+        log.info(f"\n{'=' * 72}")
+        log.info(f"Layer {layer_idx} ({len(layer_plan)} repetitions)")
+        log.info(f"{'=' * 72}")
+
+        for repetition_idx, rep in enumerate(layer_plan):
+            sentence_idx = rep["sentence_idx"]
+            sentence = rep["sentence"]
+            target_word = rep["target_word"]
+            random_word = rep["random_word"]
+
+            for strength in strengths:
+                for condition in CONDITIONS:
+                    key = trial_key(layer_idx, repetition_idx, condition, float(strength))
+                    if key in done_keys:
+                        continue
+
+                    concept_vector = None
+                    vector_word = None
+                    inject_layer = None
+                    inject_strength = None
+
+                    if condition == "inject_random":
+                        vector_word = random_word
+                        concept_vector = get_vector(vector_word, layer_idx)
+                        inject_layer = layer_idx
+                        inject_strength = float(strength)
+                    elif condition == "inject_correct":
+                        vector_word = target_word
+                        concept_vector = get_vector(vector_word, layer_idx)
+                        inject_layer = layer_idx
+                        inject_strength = float(strength)
+
+                    if condition in {"inject_random", "inject_correct"} and concept_vector is None:
+                        continue
+
+                    log.info(
+                        "  Trial: layer=%s rep=%s cond=%s strength=%s target=%s random=%s sentence_idx=%s",
+                        layer_idx,
+                        repetition_idx,
+                        condition,
+                        strength,
+                        target_word,
+                        random_word,
+                        sentence_idx,
+                    )
+
+                    result = run_trial_with_retry(
+                        model,
+                        tokenizer,
+                        sentence=sentence,
+                        concept_vector=concept_vector,
+                        layer_idx=inject_layer,
+                        strength=inject_strength,
+                        hidden_dim=hidden_dim,
+                    )
+                    if result is None:
+                        continue
+
+                    trial_data = {
+                        "run_id": run_id,
+                        "completed_at_utc": datetime.now(timezone.utc).isoformat(),
+                        "layer": layer_idx,
+                        "repetition_idx": repetition_idx,
+                        "sentence_idx": sentence_idx,
+                        "sentence": sentence,
+                        "target_word": target_word,
+                        "random_word": random_word,
+                        "condition": condition,
+                        "vector_word": vector_word,
+                        "strength": float(strength),
+                        "temperature": TEMPERATURE,
+                        "first_prompt_max_new_tokens": FIRST_PROMPT_MAX_NEW_TOKENS,
+                        "repeat_prompt_max_new_tokens": REPEAT_PROMPT_MAX_NEW_TOKENS,
+                        "first_response": result["first_response"],
+                        "repeat_response": result["repeat_response"],
+                        "first_prompt_token_count": result["first_prompt_token_count"],
+                        "repeat_prompt_token_count": result["repeat_prompt_token_count"],
+                        "span_indices": result["span_indices"],
+                    }
+                    append_trial(results_path, trial_data)
+                    done_keys.add(key)
+                    new_trials += 1
+                    log.info(
+                        "    -> first=%r | repeat=%r",
+                        result["first_response"][:80],
+                        result["repeat_response"][:80],
+                    )
+
+    log.info(f"\nExperiment complete. {new_trials} new trials. Results: {results_path}")
+    print_summary(results_path)
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
-def main():
+
+def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
@@ -549,22 +706,63 @@ def main():
     )
 
     parser = argparse.ArgumentParser(description="Prefill Detection Experiment")
-    parser.add_argument("--max-concepts", type=int, default=None,
-                        help="Limit number of concepts (for debugging)")
-    parser.add_argument("--layers", type=int, nargs="+", default=None,
-                        help="Override layers to test (e.g. --layers 20 30 40)")
-    parser.add_argument("--strengths", type=float, nargs="+", default=None,
-                        help="Override injection strengths (e.g. --strengths 2 4)")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Just print config and exit")
+    parser.add_argument(
+        "--num-repetitions",
+        type=int,
+        default=NUM_REPETITIONS_PER_LAYER,
+        help="Repetitions per layer (default: 20)",
+    )
+    parser.add_argument(
+        "--layers",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Override layers to test",
+    )
+    parser.add_argument(
+        "--strengths",
+        type=float,
+        nargs="+",
+        default=None,
+        help="Override vector strengths",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=RANDOM_SEED,
+        help="Random seed for repetition sampling",
+    )
+    parser.add_argument(
+        "--results-file",
+        type=str,
+        default="results.jsonl",
+        help="Results JSONL filename under data/results/prefill_detection/",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print protocol config and exit",
+    )
     args = parser.parse_args()
 
     if args.dry_run:
+        layers = args.layers or LAYERS_TO_TEST
+        strengths = args.strengths or INJECTION_STRENGTHS
+        total = len(layers) * args.num_repetitions * len(strengths) * len(CONDITIONS)
         print(f"Model: {MODEL_ID}")
-        print(f"Concepts: {len(CONCEPT_LIST)}")
-        print(f"Layers: {args.layers or LAYERS_TO_TEST}")
-        print(f"Strengths: {args.strengths or INJECTION_STRENGTHS}")
-        print(f"Sentences: {NUM_SENTENCES}")
+        print(f"Vector dir: {VECTOR_DIR}")
+        print(f"Layers: {layers}")
+        print(f"Repetitions/layer: {args.num_repetitions}")
+        print(f"Conditions: {CONDITIONS}")
+        print(f"Strengths: {strengths}")
+        print(
+            "Generation: "
+            f"first_prompt_max_new_tokens={FIRST_PROMPT_MAX_NEW_TOKENS}, "
+            f"repeat_prompt_max_new_tokens={REPEAT_PROMPT_MAX_NEW_TOKENS}, "
+            f"temperature={TEMPERATURE}"
+        )
+        print(f"Seed: {args.seed}")
+        print(f"Total trials: {total}")
         return
 
     run_experiment(args)
