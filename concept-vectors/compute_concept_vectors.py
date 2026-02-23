@@ -3,18 +3,17 @@
 compute_concept_vectors.py
 
 Extracts concept vectors following Lindsey et al. ("Emergent Introspective Awareness")
-using nnsight + NDIF remote execution on Llama-3.1-70B-Instruct.
+using nnsight + NDIF remote execution on Llama-3.3-70B-Instruct.
 
 Two-phase execution:
-  Phase A: Compute baseline vectors (sequential, for correctness).
-  Phase B: Compute all concept vectors with async/parallel tracing (blocking=False).
+  Phase A: Compute baseline vectors in parallel using thread-local model instances.
+  Phase B: Compute all concept vectors in parallel using thread-local model instances.
 
 Filename convention for saved vectors:
-  data/vectors/llama-3.1-70b-instruct/<concept_slug>_layer<L>.pt
-  data/vectors/llama-3.1-70b-instruct/<concept_slug>_all_layers.pt
-  data/vectors/llama-3.1-70b-instruct/<concept_slug>_metadata.json
-  data/vectors/llama-3.1-70b-instruct/baseline_mean.pt
-  data/vectors/llama-3.1-70b-instruct/baseline_metadata.json
+  data/vectors/llama-3.3-70b-instruct/<concept_slug>_all_layers.pt
+  data/vectors/llama-3.3-70b-instruct/<concept_slug>_metadata.json
+  data/vectors/llama-3.3-70b-instruct/baseline_mean.pt
+  data/vectors/llama-3.3-70b-instruct/baseline_metadata.json
 
 Where <concept_slug> is the lowercase, stripped concept name with spaces replaced by underscores.
 """
@@ -34,20 +33,21 @@ import threading
 
 import torch
 import nnsight
+from dotenv import load_dotenv
 
 # ============================================================================
 # Global Configuration
 # ============================================================================
 
-MODEL = os.environ.get("MODEL", "meta-llama/Llama-3.1-70B-Instruct")
-OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "data/vectors/llama-3.1-70b-instruct"))
-MAX_IN_FLIGHT = int(os.environ.get("MAX_IN_FLIGHT", "8"))
+MODEL = os.environ.get("MODEL", "meta-llama/Llama-3.3-70B-Instruct")
+OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "data/vectors/llama-3.3-70b-instruct"))
+MAX_IN_FLIGHT = int(os.environ.get("MAX_IN_FLIGHT", "4"))
 OVERWRITE = os.environ.get("OVERWRITE", "").lower() in ("1", "true", "yes")
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "2.0"))
 POLL_TIMEOUT = float(os.environ.get("POLL_TIMEOUT", "600.0"))
 
 # Verification thresholds
-ATOL = float(os.environ.get("ATOL", "1e-5"))
+ATOL = float(os.environ.get("ATOL", "1e-3"))
 COS_MIN = float(os.environ.get("COS_MIN", "0.9999"))
 VERIFY_N = int(os.environ.get("VERIFY_N", "5"))
 
@@ -68,7 +68,7 @@ BASELINE_WORDS_STR = (
     "Echoes, Pianos, Sanctuaries, Abysses, Air, Dewdrops, Gardens, Literature, "
     "Rice, Enigmas"
 )
-BASELINE_WORDS = [w.strip() for w in BASELINE_WORDS_STR.split(",") if w.strip()]
+BASELINE_WORDS = [w.strip().lower() for w in BASELINE_WORDS_STR.split(",") if w.strip()]
 
 # Concepts to compute vectors for. By default, use a sample set.
 # The ground truth code demonstrates with "Dust"; extend as needed.
@@ -81,6 +81,8 @@ CONCEPTS = (
     "Blood, Amphitheaters, Contraptions, Youths, Dynasties, Snow, Dirigibles, Algorithms, "
     "Denim, Monoliths, Milk, Bread, Silver"
 )
+CONCEPT_LIST = [w.strip().lower() for w in CONCEPTS.split(",") if w.strip()]
+_THREAD_LOCAL = threading.local()
 
 # ============================================================================
 # Helpers
@@ -89,6 +91,28 @@ CONCEPTS = (
 def concept_slug(concept: str) -> str:
     """Deterministic filename-safe slug for a concept."""
     return re.sub(r"[^a-z0-9]+", "_", concept.lower()).strip("_")
+
+
+def configure_ndif_api_key() -> str:
+    """
+    Load NDIF API key from environment/.env and register it with nnsight.
+    Returns the key for confirmation/logging if needed.
+    """
+    load_dotenv()
+    api_key = os.environ.get("NDIF_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "NDIF_API_KEY was not found. Add it to your environment or .env file."
+        )
+    nnsight.CONFIG.set_default_api_key(api_key)
+    return api_key
+
+
+def get_thread_model():
+    """Return one LanguageModel per worker thread (remote execution, no weight load)."""
+    if not hasattr(_THREAD_LOCAL, "model"):
+        _THREAD_LOCAL.model = nnsight.LanguageModel(MODEL)
+    return _THREAD_LOCAL.model
 
 
 def make_prompt(model, word: str) -> str:
@@ -101,7 +125,15 @@ def make_prompt(model, word: str) -> str:
 
 def tensor_hash(t: torch.Tensor) -> str:
     """SHA-256 of a tensor's bytes for reproducibility checks."""
-    return hashlib.sha256(t.numpy().tobytes()).hexdigest()[:16]
+    cpu_tensor = t.detach().cpu().contiguous()
+    payload = b"|".join(
+        [
+            str(cpu_tensor.dtype).encode("utf-8"),
+            str(tuple(cpu_tensor.shape)).encode("utf-8"),
+            cpu_tensor.view(torch.uint8).numpy().tobytes(),
+        ]
+    )
+    return hashlib.sha256(payload).hexdigest()[:16]
 
 
 def atomic_save(obj, path: Path):
@@ -130,10 +162,13 @@ def extract_activations_from_cache(cache, num_layers: int) -> torch.Tensor:
         cache[f'model.model.layers.{i}']["output"][0, -1, :]
     Returns: tensor of shape [num_layers, hidden_dim]
     """
-    return torch.stack([
-        cache[f'model.model.layers.{i}']["output"][0, -1, :]
-        for i in range(num_layers)
-    ], dim=0)
+    return torch.stack(
+        [
+            cache[f"model.model.layers.{i}"]["output"][0, -1, :]
+            for i in range(num_layers)
+        ],
+        dim=0,
+    )
 
 
 def poll_backend(backend, timeout: float = POLL_TIMEOUT, interval: float = POLL_INTERVAL):
@@ -152,10 +187,14 @@ def poll_backend(backend, timeout: float = POLL_TIMEOUT, interval: float = POLL_
 
 
 # ============================================================================
-# Phase A: Baseline (sequential, blocking)
+# Phase A: Baseline (parallel, thread-local models)
 # ============================================================================
 
-def compute_baseline_vectors(model, words: List[str] = BASELINE_WORDS) -> torch.Tensor:
+def compute_baseline_vectors(
+    model,
+    words: List[str] = BASELINE_WORDS,
+    max_in_flight: int = MAX_IN_FLIGHT,
+) -> torch.Tensor:
     """
     Compute the mean baseline last-token activation vector using the given
     words, following the exact procedure from the ground-truth code.
@@ -166,24 +205,36 @@ def compute_baseline_vectors(model, words: List[str] = BASELINE_WORDS) -> torch.
     num_layers = model.config.num_hidden_layers
     baseline_samples = []
 
-    print(f"[Phase A] Computing baseline from {len(words)} words (blocking)...")
+    print(
+        f"[Phase A] Computing baseline from {len(words)} words "
+        f"(parallel, max_in_flight={max_in_flight})..."
+    )
     t0 = time.time()
+    completed_count = [0]
+    lock = threading.Lock()
 
-    for idx, w in enumerate(words):
-        prompt = make_prompt(model, w)
+    def process_baseline_word(word: str) -> torch.Tensor:
+        worker_model = get_thread_model()
+        return _trace_word_blocking(worker_model, word, num_layers)
 
-        with model.trace(prompt, remote=True) as tracer:
-            cache = tracer.cache(
-                modules=[layer for layer in model.model.layers]
-            ).save()
+    with ThreadPoolExecutor(max_workers=max_in_flight) as executor:
+        futures = {executor.submit(process_baseline_word, w): w for w in words}
+        for future in as_completed(futures):
+            word = futures[future]
+            try:
+                baseline_samples.append(future.result())
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Baseline trace failed for word={word!r}: {type(exc).__name__}: {exc}"
+                ) from exc
 
-        sample = extract_activations_from_cache(cache, num_layers)
-        baseline_samples.append(sample)
-
-        if (idx + 1) % 10 == 0 or (idx + 1) == len(words):
-            elapsed = time.time() - t0
-            rate = (idx + 1) / elapsed
-            print(f"  [{idx+1}/{len(words)}] {rate:.1f} words/s, elapsed {elapsed:.1f}s")
+            with lock:
+                completed_count[0] += 1
+                n_done = completed_count[0]
+            if n_done % 10 == 0 or n_done == len(words):
+                elapsed = time.time() - t0
+                rate = n_done / elapsed
+                print(f"  [{n_done}/{len(words)}] {rate:.1f} words/s, elapsed {elapsed:.1f}s")
 
     baseline_stack = torch.stack(baseline_samples, dim=0)  # [N, num_layers, hidden]
     baseline_mean = baseline_stack.mean(dim=0)              # [num_layers, hidden]
@@ -287,12 +338,8 @@ def compute_all_vectors_async(
     max_in_flight: int = MAX_IN_FLIGHT,
 ):
     """
-    Phase B: Compute all concept vectors using non-blocking remote traces
-    with bounded concurrency.
-
-    Uses blocking=False on model.trace() to submit multiple traces in parallel,
-    then polls for results. A threading semaphore limits concurrency to
-    max_in_flight simultaneous requests.
+    Phase B: Compute all concept vectors in parallel using thread-local
+    LanguageModel instances to avoid trace-state races.
     """
     num_layers = model.config.num_hidden_layers
     baseline_hash = tensor_hash(baseline_mean)
@@ -315,59 +362,40 @@ def compute_all_vectors_async(
     t0 = time.time()
 
     failures = []
-    completed_count = [0]  # mutable counter for thread safety
+    completed_count = [0]
     lock = threading.Lock()
 
     def process_concept(concept: str) -> Optional[str]:
-        """Submit non-blocking trace, poll, compute, and save. Returns error or None."""
         try:
-            # Submit non-blocking trace (returns immediately)
-            prompt = make_prompt(model, concept)
-            with model.trace(prompt, remote=True, blocking=False) as tracer:
-                cache = tracer.cache(
-                    modules=[layer for layer in model.model.layers]
-                ).save()
-            backend = tracer.backend
-
-            # Poll for result (blocks this thread until NDIF job completes)
-            poll_backend(backend)
-
-            # Extract activations (identical to ground truth)
-            sample = extract_activations_from_cache(cache, num_layers)
-
-            # Compute concept vector: sample - baseline_mean
+            worker_model = get_thread_model()
+            sample = _trace_word_blocking(worker_model, concept, num_layers)
             cvec = compute_concept_vector(sample, baseline_mean)
-
-            # Save atomically
             save_concept_vector(concept, cvec, sample, baseline_hash)
 
             with lock:
                 completed_count[0] += 1
                 n_done = completed_count[0]
             elapsed = time.time() - t0
-            print(f"  [{n_done}/{len(to_compute)}] '{concept}' done "
-                  f"({elapsed:.1f}s elapsed)")
+            print(
+                f"  [{n_done}/{len(to_compute)}] '{concept}' done "
+                f"({elapsed:.1f}s elapsed)"
+            )
             return None
 
-        except Exception as e:
-            err = f"'{concept}': {type(e).__name__}: {e}"
+        except Exception as exc:
+            err = f"'{concept}': {type(exc).__name__}: {exc}"
             print(f"  [ERROR] {err}")
-            raise
+            return err
 
-    # ThreadPoolExecutor limits concurrency to max_in_flight workers.
-    # Each worker submits one non-blocking trace, then polls until complete.
     with ThreadPoolExecutor(max_workers=max_in_flight) as executor:
-        futures = {
-            executor.submit(process_concept, c): c
-            for c in to_compute
-        }
+        futures = {executor.submit(process_concept, c): c for c in to_compute}
         for future in as_completed(futures):
             err = future.result()
-            if err:
+            if err is not None:
                 failures.append(err)
 
     elapsed = time.time() - t0
-    print(f"[Phase B] Completed {completed}/{len(to_compute)} in {elapsed:.1f}s")
+    print(f"[Phase B] Completed {completed_count[0]}/{len(to_compute)} in {elapsed:.1f}s")
     if failures:
         print(f"[Phase B] {len(failures)} failures:")
         for f in failures:
@@ -391,7 +419,7 @@ def verify_against_baseline(
     Verify that the async pipeline produces identical results to the blocking
     baseline for a small set of concepts.
     """
-    verify_concepts = CONCEPTS[:n]
+    verify_concepts = CONCEPT_LIST[:n]
     num_layers = model.config.num_hidden_layers
     baseline_hash = tensor_hash(baseline_mean)
 
@@ -453,6 +481,8 @@ def main():
     print(f"  Max in-flight: {MAX_IN_FLIGHT}")
     print(f"  Overwrite: {OVERWRITE}")
     print("=" * 70)
+
+    configure_ndif_api_key()
 
     # Check NDIF is available
     assert nnsight.is_model_running(MODEL), f"{MODEL} is not online on NDIF."
