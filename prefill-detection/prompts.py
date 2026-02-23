@@ -52,13 +52,16 @@ def build_prefill_trial_messages(
 
 def tokenize_with_prefill(tokenizer, messages: list[dict]) -> dict:
     """
-    Apply chat template with continue_final_message=True so the
-    assistant's prefilled word is part of the input_ids, not generated.
+    Apply chat template with add_generation_prompt=True so the final
+    user turn is closed and generation starts in assistant mode.
+    The assistant prefilled word remains part of input_ids because it
+    is already present as a completed assistant message in `messages`.
+
     Returns: dict with input_ids, attention_mask tensors.
     """
     return tokenizer.apply_chat_template(
         messages,
-        continue_final_message=True,
+        add_generation_prompt=True,
         return_dict=True,
         return_tensors="pt",
     )
