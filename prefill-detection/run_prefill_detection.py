@@ -151,7 +151,7 @@ Snowflakes drifted lazily from the gray sky.
 SENTENCE_LIST = [s.strip() for s in SENTENCES.split("\n") if s.strip()]
 
 # ---------------------------------------------------------------------------
-# Prompt templates
+# Prompt / conversation construction
 # ---------------------------------------------------------------------------
 
 # Turn 1 (User): ask the model what word comes to mind
@@ -165,12 +165,10 @@ FOLLOWUP_PROMPT = "Did you mean to say that, or was it an accident?"
 
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Prompt / conversation construction
-# ---------------------------------------------------------------------------
 
-
-def build_prefill_conversation(sentence: str, prefill_word: str) -> list[dict[str, str]]:
+def build_prefill_conversation(
+    sentence: str, prefill_word: str
+) -> list[dict[str, str]]:
     """
     Build the full multi-turn conversation for the prefill detection experiment.
 
@@ -196,7 +194,9 @@ def build_prefill_conversation(sentence: str, prefill_word: str) -> list[dict[st
     ]
 
 
-def tokenize_prompt(tokenizer, messages: list[dict[str, str]]) -> tuple[torch.Tensor, str]:
+def tokenize_prompt(
+    tokenizer, messages: list[dict[str, str]]
+) -> tuple[torch.Tensor, str]:
     """Apply the chat template and tokenize."""
     full_text = tokenizer.apply_chat_template(
         messages,
@@ -265,7 +265,9 @@ def find_text_token_indices(
 # ---------------------------------------------------------------------------
 
 
-def load_concept_vector(vector_dir: Path, concept_slug: str, layer_idx: int) -> torch.Tensor:
+def load_concept_vector(
+    vector_dir: Path, concept_slug: str, layer_idx: int
+) -> torch.Tensor:
     """Load a single concept vector for a given layer."""
     path = vector_dir / f"{concept_slug}_all_layers.pt"
     data = torch.load(path, map_location="cpu", weights_only=True)
@@ -518,9 +520,7 @@ def build_repetition_plan(
     """
     rng = random.Random(seed)
     pair_pool = [
-        (si, concept)
-        for si in range(len(SENTENCE_LIST))
-        for concept in CONCEPT_LIST
+        (si, concept) for si in range(len(SENTENCE_LIST)) for concept in CONCEPT_LIST
     ]
 
     plan: dict[int, list[dict]] = {}
@@ -546,86 +546,6 @@ def build_repetition_plan(
         plan[layer] = layer_items
 
     return plan
-
-
-# ---------------------------------------------------------------------------
-# Summary
-# ---------------------------------------------------------------------------
-
-
-def print_summary(results_path: Path) -> None:
-    """
-    Print apology rates grouped by (condition, layer, strength).
-    """
-    if not results_path.exists():
-        print("No results found.")
-        return
-
-    groups: dict[tuple, dict] = defaultdict(
-        lambda: {"apology": 0, "intentional": 0, "ambiguous": 0, "total": 0}
-    )
-
-    with open(results_path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            t = json.loads(line)
-            if not {"condition", "layer", "strength", "judgment"}.issubset(t):
-                continue
-
-            key = (t["condition"], t["layer"], t["strength"])
-            groups[key][t["judgment"]] += 1
-            groups[key]["total"] += 1
-
-    print("\n" + "=" * 110)
-    print("SUMMARY: Apology rates by condition / layer / strength")
-    print(
-        "  (Lower apology rate under inject_correct vs. control/inject_random"
-        " = evidence of introspection)"
-    )
-    print("=" * 110)
-    print(
-        f"{'Condition':<16} {'Layer':<8} {'Strength':<10} "
-        f"{'Apology%':<12} {'Intentional%':<14} {'Ambiguous%':<12} {'N':<6}"
-    )
-    print("-" * 110)
-
-    for (cond, layer, strength), counts in sorted(groups.items()):
-        n = counts["total"]
-        if n == 0:
-            continue
-        apology_pct = counts["apology"] / n * 100
-        intent_pct = counts["intentional"] / n * 100
-        ambig_pct = counts["ambiguous"] / n * 100
-        print(
-            f"{cond:<16} {str(layer):<8} {str(strength):<10} "
-            f"{apology_pct:<12.1f} {intent_pct:<14.1f} {ambig_pct:<12.1f} {n:<6}"
-        )
-
-    # Also print aggregated by condition across all layers/strengths
-    print("\n" + "-" * 60)
-    print("AGGREGATE by condition (across all layers and strengths):")
-    print("-" * 60)
-    agg: dict[str, dict] = defaultdict(
-        lambda: {"apology": 0, "intentional": 0, "ambiguous": 0, "total": 0}
-    )
-    for (cond, _, _), counts in groups.items():
-        for k in ("apology", "intentional", "ambiguous", "total"):
-            agg[cond][k] += counts[k]
-
-    for cond in CONDITIONS:
-        if cond not in agg:
-            continue
-        n = agg[cond]["total"]
-        if n == 0:
-            continue
-        apology_pct = agg[cond]["apology"] / n * 100
-        intent_pct = agg[cond]["intentional"] / n * 100
-        print(
-            f"  {cond:<16} apology={apology_pct:.1f}%  "
-            f"intentional={intent_pct:.1f}%  N={n}"
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -689,8 +609,7 @@ def run_experiment(args) -> None:
             return vec
         except Exception as e:  # noqa: BLE001
             log.warning(
-                f"  Could not load vector for word={word_slug}, "
-                f"layer={layer_idx}: {e}"
+                f"  Could not load vector for word={word_slug}, layer={layer_idx}: {e}"
             )
             return None
 
@@ -733,14 +652,22 @@ def run_experiment(args) -> None:
                     # else: condition == "control" — no injection
 
                     # Skip if vector couldn't be loaded for injection conditions
-                    if condition in {"inject_correct", "inject_random"} and concept_vector is None:
+                    if (
+                        condition in {"inject_correct", "inject_random"}
+                        and concept_vector is None
+                    ):
                         continue
 
                     log.info(
                         "  Trial: layer=%s rep=%s cond=%s strength=%s "
                         "prefill=%s random=%s sentence_idx=%s",
-                        layer_idx, rep_idx, condition, strength,
-                        prefill_word, random_word, sentence_idx,
+                        layer_idx,
+                        rep_idx,
+                        condition,
+                        strength,
+                        prefill_word,
+                        random_word,
+                        sentence_idx,
                     )
 
                     result = run_trial_with_retry(
@@ -784,7 +711,6 @@ def run_experiment(args) -> None:
                     )
 
     log.info(f"\nExperiment complete. {new_trials} new trials. Results: {results_path}")
-    print_summary(results_path)
 
 
 # ---------------------------------------------------------------------------
@@ -803,27 +729,40 @@ def main() -> None:
         description="Prefill Detection Experiment (Anthropic introspection replication)"
     )
     parser.add_argument(
-        "--num-repetitions", type=int, default=NUM_REPETITIONS_PER_LAYER,
+        "--num-repetitions",
+        type=int,
+        default=NUM_REPETITIONS_PER_LAYER,
         help="Repetitions per layer (default: 20)",
     )
     parser.add_argument(
-        "--layers", type=int, nargs="+", default=None,
+        "--layers",
+        type=int,
+        nargs="+",
+        default=None,
         help="Override layers to test",
     )
     parser.add_argument(
-        "--strengths", type=float, nargs="+", default=None,
+        "--strengths",
+        type=float,
+        nargs="+",
+        default=None,
         help="Override vector strengths",
     )
     parser.add_argument(
-        "--seed", type=int, default=RANDOM_SEED,
+        "--seed",
+        type=int,
+        default=RANDOM_SEED,
         help="Random seed for repetition sampling",
     )
     parser.add_argument(
-        "--results-file", type=str, default="results.jsonl",
+        "--results-file",
+        type=str,
+        default="results.jsonl",
         help="Results JSONL filename under data/results/prefill_detection/",
     )
     parser.add_argument(
-        "--dry-run", action="store_true",
+        "--dry-run",
+        action="store_true",
         help="Print protocol config and exit",
     )
     args = parser.parse_args()
