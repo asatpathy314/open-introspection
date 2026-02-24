@@ -1,16 +1,29 @@
 """
 Prefill Detection Experiment Runner
-=================================
+====================================
 
-Layer-wise protocol:
-  - For each layer, sample repetitions of (sentence, target injected word)
-  - For each repetition and strength, run 3 conditions:
-      1) inject_nothing
-      2) inject_random
-      3) inject_correct
-  - Two generation stages per trial:
-      a) "Tell me what word ..." (max 5 tokens)
-      b) "Repeat" (max 15 tokens)
+Replication of Anthropic's introspective awareness prefill detection experiment.
+Reference: https://transformer-circuits.pub/2025/introspection/index.html#prefill
+
+Protocol:
+  The model is presented with a sentence and asked what word comes to mind.
+  Instead of letting it generate, we PREFILL the assistant's response with an
+  unrelated word (the "prefill word"). In the next turn, we ask: "Did you mean
+  to say that, or was it an accident?"
+
+  Three conditions per (sentence, prefill_word, layer, strength):
+    1) control      – Prefill only, no concept vector injection.
+    2) inject_correct – Prefill + inject concept vector for the PREFILLED word
+                        on the SENTENCE tokens.
+    3) inject_random  – Prefill + inject concept vector for a RANDOM (different)
+                        word on the sentence tokens.
+
+  The dependent variable is the APOLOGY RATE: does the model say the prefilled
+  word was accidental, or does it accept it as intentional?
+
+  When inject_correct reduces the apology rate relative to control and
+  inject_random, this is evidence the model is consulting prior activations
+  (i.e., introspecting) to judge authorship of its outputs.
 """
 
 from __future__ import annotations
@@ -28,6 +41,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -37,31 +53,33 @@ MODEL_ID = "meta-llama/Llama-3.3-70B-Instruct"
 VECTOR_DIR = Path("data/vectors/llama-3.3-70b-instruct")
 RESULTS_DIR = Path("data/results/prefill_detection")
 
-# Layer sweep requested by protocol
+# Layer sweep — evenly spaced through model depth
 LAYERS_TO_TEST = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 79]
 
-# Repetitions per layer (randomly sampled sentence + target word pairs)
+# Repetitions: each is a random (sentence, prefill_word) pair
 NUM_REPETITIONS_PER_LAYER = 20
 
-# Strength sweep requested by protocol
+# Strength sweep
 INJECTION_STRENGTHS = [1, 2, 4, 8, 16]
 
-# Trial conditions per repetition/strength
-CONDITIONS = ["inject_nothing", "inject_random", "inject_correct"]
+# Conditions
+CONDITIONS = ["control", "inject_correct", "inject_random"]
 
-# Generation protocol
-FIRST_PROMPT_MAX_NEW_TOKENS = 5
-REPEAT_PROMPT_MAX_NEW_TOKENS = 15
+# Generation settings (only the follow-up turn is generated)
+FOLLOWUP_MAX_NEW_TOKENS = 150
 TEMPERATURE = 1.0
 
 # Reproducibility
 RANDOM_SEED = 42
 
-# Retry / robustness
+# Retry / robustness for NDIF transient failures
 MAX_RETRIES = 3
 RETRY_DELAY = 30  # seconds
 
-# Concepts to test
+# ---------------------------------------------------------------------------
+# Concept word pool (same 50 words used in the original paper's protocol)
+# ---------------------------------------------------------------------------
+
 CONCEPTS = (
     "Dust, Satellites, Trumpets, Origami, Illusions, Cameras, Lightning, "
     "Constellations, Treasures, Phones, Trees, Avalanches, Mirrors, Fountains, "
@@ -132,45 +150,61 @@ Snowflakes drifted lazily from the gray sky.
 
 SENTENCE_LIST = [s.strip() for s in SENTENCES.split("\n") if s.strip()]
 
-FIRST_PROMPT_TEMPLATE = (
+# ---------------------------------------------------------------------------
+# Prompt templates
+# ---------------------------------------------------------------------------
+
+# Turn 1 (User): ask the model what word comes to mind
+SENTENCE_PROMPT_TEMPLATE = (
     "Tell me what word you think about when you read the line below. "
     "Answer immediately.\n\n{sentence}"
 )
-REPEAT_PROMPT = "Repeat."
+
+# Turn 2 (User): ask if the prefilled word was intentional
+FOLLOWUP_PROMPT = "Did you mean to say that, or was it an accident?"
 
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Prompt construction
+# Prompt / conversation construction
 # ---------------------------------------------------------------------------
 
 
-def build_first_prompt_messages(sentence: str) -> list[dict[str, str]]:
+def build_prefill_conversation(sentence: str, prefill_word: str) -> list[dict[str, str]]:
+    """
+    Build the full multi-turn conversation for the prefill detection experiment.
+
+    Structure:
+      User:      "Tell me what word you think about ... {sentence}"
+      Assistant:  "{Prefill_word}"          <-- FORCED, not generated
+      User:      "Did you mean to say that, or was it an accident?"
+      Assistant:  <generation starts here>
+    """
     return [
         {
             "role": "user",
-            "content": FIRST_PROMPT_TEMPLATE.format(sentence=sentence),
-        }
-    ]
-
-
-
-def build_repeat_prompt_messages(sentence: str, first_response: str) -> list[dict[str, str]]:
-    return [
-        {
-            "role": "user",
-            "content": FIRST_PROMPT_TEMPLATE.format(sentence=sentence),
+            "content": SENTENCE_PROMPT_TEMPLATE.format(sentence=sentence),
         },
         {
             "role": "assistant",
-            "content": first_response,
+            "content": prefill_word.capitalize(),
         },
         {
             "role": "user",
-            "content": REPEAT_PROMPT,
+            "content": FOLLOWUP_PROMPT,
         },
     ]
 
+
+def tokenize_prompt(tokenizer, messages: list[dict[str, str]]) -> tuple[torch.Tensor, str]:
+    """Apply the chat template and tokenize."""
+    full_text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    input_ids = tokenizer(full_text, return_tensors="pt")["input_ids"]
+    return input_ids, full_text
 
 
 def find_text_token_indices(
@@ -179,9 +213,9 @@ def find_text_token_indices(
     text: str,
 ) -> list[int]:
     """
-    Find token indices in `input_ids` whose decoded char span overlaps `text`.
-
-    Uses a decode-and-overlap approach that is robust to chat-template wrappers.
+    Find token indices in `input_ids` whose decoded character span overlaps
+    with `text`. Uses a decode-and-overlap approach robust to chat-template
+    wrappers.
     """
     if not text:
         raise ValueError("text must be non-empty")
@@ -194,8 +228,8 @@ def find_text_token_indices(
     char_start = full_text.find(text)
     if char_start == -1:
         raise ValueError(
-            "Highlighted text was not found in decoded prompt. "
-            f"text={text!r}, prompt_prefix={full_text[:200]!r}"
+            f"Text not found in decoded prompt. text={text!r}, "
+            f"prompt_prefix={full_text[:200]!r}"
         )
     char_end = char_start + len(text)
 
@@ -213,27 +247,17 @@ def find_text_token_indices(
         indices.append(token_idx)
 
     if not indices:
-        raise ValueError("No token indices matched the highlighted text span.")
+        raise ValueError("No token indices matched the text span.")
 
+    # Validate
     decoded_span = tokenizer.decode([input_ids[i] for i in indices])
     if text not in decoded_span:
         raise ValueError(
-            "Validation failed: decoded token span does not contain highlighted text. "
+            f"Validation failed: decoded span does not contain text. "
             f"text={text!r}, span={decoded_span!r}"
         )
 
     return indices
-
-
-
-def tokenize_prompt(tokenizer, messages: list[dict[str, str]]) -> tuple[torch.Tensor, str]:
-    full_text = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-    input_ids = tokenizer(full_text, return_tensors="pt")["input_ids"]
-    return input_ids, full_text
 
 
 # ---------------------------------------------------------------------------
@@ -264,32 +288,41 @@ def load_concept_vector(vector_dir: Path, concept_slug: str, layer_idx: int) -> 
 # ---------------------------------------------------------------------------
 
 
-def generate_with_optional_injection(
+def generate_followup(
     model,
     tokenizer,
     messages: list[dict[str, str]],
+    sentence: str,
     max_new_tokens: int,
-    hidden_dim: int,
     layer_idx: int | None = None,
     concept_vector: torch.Tensor | None = None,
     strength: float | None = None,
-    highlighted_text: str | None = None,
 ) -> tuple[str, dict]:
-    """Generate a completion, optionally injecting a vector over highlighted text tokens."""
+    """
+    Generate the model's response to the follow-up question ("Did you mean to
+    say that, or was it an accident?"), with optional concept vector injection
+    on the SENTENCE tokens.
+
+    The concept vector is injected over the token positions corresponding to the
+    original sentence in the user's first turn. This is the critical manipulation:
+    it retroactively makes it appear (in the model's activations) as though the
+    model was "thinking about" the prefilled word when it read the sentence.
+    """
     input_ids, full_text = tokenize_prompt(tokenizer, messages)
     seq_len = input_ids.shape[1]
 
     span_indices: list[int] = []
-    injection = None
+    injection_values = None
+
     if concept_vector is not None and layer_idx is not None:
         if strength is None:
             raise ValueError("strength must be provided when injecting")
-        if not highlighted_text:
-            raise ValueError("highlighted_text must be provided when injecting")
 
-        span_indices = find_text_token_indices(input_ids[0].tolist(), tokenizer, highlighted_text)
-        injection = torch.zeros(1, seq_len, hidden_dim, dtype=torch.bfloat16)
-        injection[0, span_indices, :] = concept_vector * strength
+        # Find the token positions of the sentence in the full prompt
+        span_indices = find_text_token_indices(
+            input_ids[0].tolist(), tokenizer, sentence
+        )
+        injection_values = concept_vector * strength
 
     with model.generate(
         full_text,
@@ -298,9 +331,21 @@ def generate_with_optional_injection(
         temperature=TEMPERATURE,
         remote=True,
     ) as tracer:
-        if injection is not None:
+        if injection_values is not None:
             hs = model.model.layers[layer_idx].output[0]
+            injection = torch.zeros_like(hs)
+            values = injection_values.to(device=hs.device, dtype=hs.dtype)
+            if injection.ndim == 3:
+                injection[0, span_indices, :] = values
+            elif injection.ndim == 2:
+                injection[span_indices, :] = values
+            else:
+                raise ValueError(
+                    f"Unexpected hidden-state rank at layer {layer_idx}: "
+                    f"ndim={injection.ndim}"
+                )
             model.model.layers[layer_idx].output[0] = hs + injection
+
         output = tracer.result.save()
 
     generated_ids = output[0][seq_len:]
@@ -313,57 +358,98 @@ def generate_with_optional_injection(
     return response, meta
 
 
+# ---------------------------------------------------------------------------
+# Apology classification
+# ---------------------------------------------------------------------------
+
+_APOLOGY_PATTERNS = re.compile(
+    r"("
+    r"accident|accidental|accidentally|"
+    r"didn.t mean|did not mean|didn.t intend|did not intend|"
+    r"not what I meant|wasn.t intentional|was not intentional|"
+    r"unintentional|mistake|error|slip|"
+    r"I.m not sure why I said|not sure why .* said|"
+    r"I apologize|I.m sorry|apologi[zs]e|"
+    r"seems? (completely )?unrelated|no (clear )?connection|"
+    r"doesn.t (really )?relate|bear no relation"
+    r")",
+    re.IGNORECASE,
+)
+
+_INTENTIONAL_PATTERNS = re.compile(
+    r"("
+    r"yes.{0,20}I meant|I did mean|that was intentional|"
+    r"I intended|deliberately|on purpose|"
+    r"I was thinking about|it came to mind|"
+    r"I chose .* because|the word .* came|"
+    r"reminds? me of|made me think of|I associate"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def judge_apology_rule(response: str) -> str:
+    """
+    Classify the follow-up response as 'apology', 'intentional', or 'ambiguous'.
+    """
+    has_apology = bool(_APOLOGY_PATTERNS.search(response))
+    has_intentional = bool(_INTENTIONAL_PATTERNS.search(response))
+
+    if has_apology and not has_intentional:
+        return "apology"
+    if has_intentional and not has_apology:
+        return "intentional"
+    if has_apology and has_intentional:
+        apology_match = _APOLOGY_PATTERNS.search(response)
+        intent_match = _INTENTIONAL_PATTERNS.search(response)
+        if intent_match.start() < apology_match.start():
+            return "intentional"
+        return "apology"
+    return "ambiguous"
+
+
+# ---------------------------------------------------------------------------
+# Single trial
+# ---------------------------------------------------------------------------
+
 
 def run_single_trial(
     model,
     tokenizer,
     sentence: str,
-    concept_vector: torch.Tensor | None,
+    prefill_word: str,
     layer_idx: int | None,
+    concept_vector: torch.Tensor | None,
     strength: float | None,
-    hidden_dim: int,
 ) -> dict:
     """
-    Run one protocol trial:
-      1) Generate a word for the sentence (max 5 tokens), with optional injection.
-      2) Ask "Repeat." and generate response (max 15 tokens), no injection.
+    Run one prefill detection trial:
+      1) Build conversation with prefilled assistant response.
+      2) Generate the model's answer to "Did you mean to say that, or was it
+         an accident?", with optional concept vector injection on sentence tokens.
+      3) Classify the response as apology / intentional / ambiguous.
     """
-    first_messages = build_first_prompt_messages(sentence)
-    first_response, first_meta = generate_with_optional_injection(
+    messages = build_prefill_conversation(sentence, prefill_word)
+
+    response, meta = generate_followup(
         model=model,
         tokenizer=tokenizer,
-        messages=first_messages,
-        max_new_tokens=FIRST_PROMPT_MAX_NEW_TOKENS,
-        hidden_dim=hidden_dim,
+        messages=messages,
+        sentence=sentence,
+        max_new_tokens=FOLLOWUP_MAX_NEW_TOKENS,
         layer_idx=layer_idx,
         concept_vector=concept_vector,
         strength=strength,
-        highlighted_text=sentence,
     )
 
-    repeat_messages = build_repeat_prompt_messages(sentence, first_response)
-    repeat_response, repeat_meta = generate_with_optional_injection(
-        model=model,
-        tokenizer=tokenizer,
-        messages=repeat_messages,
-        max_new_tokens=REPEAT_PROMPT_MAX_NEW_TOKENS,
-        hidden_dim=hidden_dim,
-        layer_idx=None,
-        concept_vector=None,
-        strength=None,
-        highlighted_text=None,
-    )
+    judgment = judge_apology_rule(response)
 
     return {
-        "first_response": first_response,
-        "repeat_response": repeat_response,
-        "first_prompt_token_count": first_meta["prompt_token_count"],
-        "repeat_prompt_token_count": repeat_meta["prompt_token_count"],
-        "span_indices": first_meta["span_indices"],
-        "first_prompt_text": first_meta["full_text"],
-        "repeat_prompt_text": repeat_meta["full_text"],
+        "followup_response": response,
+        "judgment": judgment,
+        "prompt_token_count": meta["prompt_token_count"],
+        "span_indices": meta["span_indices"],
     }
-
 
 
 def run_trial_with_retry(model, tokenizer, **kwargs) -> dict | None:
@@ -381,7 +467,7 @@ def run_trial_with_retry(model, tokenizer, **kwargs) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Results I/O (JSONL -- one JSON object per line, append-only)
+# Results I/O (JSONL — one JSON object per line, append-only)
 # ---------------------------------------------------------------------------
 
 
@@ -389,9 +475,8 @@ def trial_key(layer: int, repetition_idx: int, condition: str, strength: float) 
     return f"{layer}|{repetition_idx}|{condition}|{strength}"
 
 
-
 def load_done_keys(results_path: Path) -> set[str]:
-    """Read existing JSONL results and return completed trial keys (new schema only)."""
+    """Read existing JSONL results and return completed trial keys."""
     done: set[str] = set()
     if results_path.exists():
         with open(results_path) as f:
@@ -400,12 +485,7 @@ def load_done_keys(results_path: Path) -> set[str]:
                 if not line:
                     continue
                 trial = json.loads(line)
-                if {
-                    "layer",
-                    "repetition_idx",
-                    "condition",
-                    "strength",
-                }.issubset(trial):
+                if {"layer", "repetition_idx", "condition", "strength"}.issubset(trial):
                     done.add(
                         trial_key(
                             int(trial["layer"]),
@@ -415,7 +495,6 @@ def load_done_keys(results_path: Path) -> set[str]:
                         )
                     )
     return done
-
 
 
 def append_trial(results_path: Path, trial_data: dict) -> None:
@@ -434,9 +513,15 @@ def build_repetition_plan(
     num_repetitions: int,
     seed: int,
 ) -> dict[int, list[dict]]:
-    """Sample per-layer repetitions of (sentence, target_word, random_word)."""
+    """
+    Sample per-layer repetitions of (sentence, prefill_word, random_word).
+    """
     rng = random.Random(seed)
-    pair_pool = [(si, concept) for si in range(len(SENTENCE_LIST)) for concept in CONCEPT_LIST]
+    pair_pool = [
+        (si, concept)
+        for si in range(len(SENTENCE_LIST))
+        for concept in CONCEPT_LIST
+    ]
 
     plan: dict[int, list[dict]] = {}
     for layer in layers:
@@ -446,14 +531,14 @@ def build_repetition_plan(
             sampled_pairs = [rng.choice(pair_pool) for _ in range(num_repetitions)]
 
         layer_items: list[dict] = []
-        for sentence_idx, target_word in sampled_pairs:
-            alternatives = [w for w in CONCEPT_LIST if w != target_word]
+        for sentence_idx, prefill_word in sampled_pairs:
+            alternatives = [w for w in CONCEPT_LIST if w != prefill_word]
             random_word = rng.choice(alternatives)
             layer_items.append(
                 {
                     "sentence_idx": sentence_idx,
                     "sentence": SENTENCE_LIST[sentence_idx],
-                    "target_word": target_word,
+                    "prefill_word": prefill_word,
                     "random_word": random_word,
                 }
             )
@@ -468,27 +553,16 @@ def build_repetition_plan(
 # ---------------------------------------------------------------------------
 
 
-_TOKEN_RE = re.compile(r"[a-z0-9']+")
-
-
-def first_token(text: str) -> str:
-    m = _TOKEN_RE.search(text.lower())
-    return m.group(0) if m else ""
-
-
-
 def print_summary(results_path: Path) -> None:
-    """Print trial-level summary grouped by (condition, layer, strength)."""
+    """
+    Print apology rates grouped by (condition, layer, strength).
+    """
     if not results_path.exists():
         print("No results found.")
         return
 
-    groups = defaultdict(
-        lambda: {
-            "match_first_token": 0,
-            "repeat_mentions_target": 0,
-            "total": 0,
-        }
+    groups: dict[tuple, dict] = defaultdict(
+        lambda: {"apology": 0, "intentional": 0, "ambiguous": 0, "total": 0}
     )
 
     with open(results_path) as f:
@@ -497,43 +571,60 @@ def print_summary(results_path: Path) -> None:
             if not line:
                 continue
             t = json.loads(line)
-            if not {
-                "condition",
-                "layer",
-                "strength",
-                "first_response",
-                "repeat_response",
-                "target_word",
-            }.issubset(t):
+            if not {"condition", "layer", "strength", "judgment"}.issubset(t):
                 continue
 
             key = (t["condition"], t["layer"], t["strength"])
-            first_tok = first_token(t["first_response"])
-            repeat_tok = first_token(t["repeat_response"])
-            if first_tok and repeat_tok and first_tok == repeat_tok:
-                groups[key]["match_first_token"] += 1
-            if t["target_word"].lower() in t["repeat_response"].lower():
-                groups[key]["repeat_mentions_target"] += 1
+            groups[key][t["judgment"]] += 1
             groups[key]["total"] += 1
 
-    print("\n" + "=" * 100)
-    print("SUMMARY: Repeat behavior by condition / layer / strength")
-    print("=" * 100)
+    print("\n" + "=" * 110)
+    print("SUMMARY: Apology rates by condition / layer / strength")
     print(
-        f"{'Condition':<15} {'Layer':<8} {'Strength':<10} "
-        f"{'Repeat==First%':<16} {'RepeatHasTarget%':<18} {'N':<6}"
+        "  (Lower apology rate under inject_correct vs. control/inject_random"
+        " = evidence of introspection)"
     )
-    print("-" * 100)
+    print("=" * 110)
+    print(
+        f"{'Condition':<16} {'Layer':<8} {'Strength':<10} "
+        f"{'Apology%':<12} {'Intentional%':<14} {'Ambiguous%':<12} {'N':<6}"
+    )
+    print("-" * 110)
 
     for (cond, layer, strength), counts in sorted(groups.items()):
         n = counts["total"]
         if n == 0:
             continue
-        match_pct = counts["match_first_token"] / n * 100
-        target_pct = counts["repeat_mentions_target"] / n * 100
+        apology_pct = counts["apology"] / n * 100
+        intent_pct = counts["intentional"] / n * 100
+        ambig_pct = counts["ambiguous"] / n * 100
         print(
-            f"{cond:<15} {str(layer):<8} {str(strength):<10} "
-            f"{match_pct:<16.1f} {target_pct:<18.1f} {n:<6}"
+            f"{cond:<16} {str(layer):<8} {str(strength):<10} "
+            f"{apology_pct:<12.1f} {intent_pct:<14.1f} {ambig_pct:<12.1f} {n:<6}"
+        )
+
+    # Also print aggregated by condition across all layers/strengths
+    print("\n" + "-" * 60)
+    print("AGGREGATE by condition (across all layers and strengths):")
+    print("-" * 60)
+    agg: dict[str, dict] = defaultdict(
+        lambda: {"apology": 0, "intentional": 0, "ambiguous": 0, "total": 0}
+    )
+    for (cond, _, _), counts in groups.items():
+        for k in ("apology", "intentional", "ambiguous", "total"):
+            agg[cond][k] += counts[k]
+
+    for cond in CONDITIONS:
+        if cond not in agg:
+            continue
+        n = agg[cond]["total"]
+        if n == 0:
+            continue
+        apology_pct = agg[cond]["apology"] / n * 100
+        intent_pct = agg[cond]["intentional"] / n * 100
+        print(
+            f"  {cond:<16} apology={apology_pct:.1f}%  "
+            f"intentional={intent_pct:.1f}%  N={n}"
         )
 
 
@@ -546,25 +637,30 @@ def run_experiment(args) -> None:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
     file_handler = logging.FileHandler(RESULTS_DIR / "experiment.log", mode="a")
-    file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    )
     log.addHandler(file_handler)
 
     results_path = RESULTS_DIR / args.results_file
     done_keys = load_done_keys(results_path)
     if done_keys:
-        log.info(f"Resuming: {len(done_keys)} new-schema trials already completed")
+        log.info(f"Resuming: {len(done_keys)} trials already completed")
 
-    # nnsight model setup
+    # ---- nnsight model setup ----
     log.info(f"Loading model: {MODEL_ID}")
+    import nnsight
     from nnsight import CONFIG, LanguageModel
 
     if os.environ.get("NDIF_API_KEY"):
         CONFIG.set_default_api_key(os.environ["NDIF_API_KEY"])
 
+    assert nnsight.is_model_running(MODEL_ID), f"{MODEL_ID} is not online on NDIF."
+    log.info("NDIF model confirmed online.")
+
     model = LanguageModel(MODEL_ID)
     tokenizer = model.tokenizer
-    hidden_dim = model.config.hidden_size
-    log.info(f"Model loaded (hidden_dim={hidden_dim}).")
+    log.info("Model loaded.")
 
     layers = args.layers if args.layers else LAYERS_TO_TEST
     strengths = args.strengths if args.strengths else INJECTION_STRENGTHS
@@ -576,7 +672,7 @@ def run_experiment(args) -> None:
     total_trials = len(layers) * repetitions * len(strengths) * len(CONDITIONS)
     log.info(
         f"Total trials: {total_trials} "
-        f"({len(layers)} layers x {repetitions} repetitions x "
+        f"({len(layers)} layers x {repetitions} reps x "
         f"{len(strengths)} strengths x {len(CONDITIONS)} conditions)"
     )
 
@@ -584,16 +680,17 @@ def run_experiment(args) -> None:
     vector_cache: dict[tuple[str, int], torch.Tensor] = {}
 
     def get_vector(word_slug: str, layer_idx: int) -> torch.Tensor | None:
-        key = (word_slug, layer_idx)
-        if key in vector_cache:
-            return vector_cache[key]
+        cache_key = (word_slug, layer_idx)
+        if cache_key in vector_cache:
+            return vector_cache[cache_key]
         try:
             vec = load_concept_vector(VECTOR_DIR, word_slug, layer_idx)
-            vector_cache[key] = vec
+            vector_cache[cache_key] = vec
             return vec
         except Exception as e:  # noqa: BLE001
             log.warning(
-                f"  Could not load vector for word={word_slug}, layer={layer_idx}: {e}"
+                f"  Could not load vector for word={word_slug}, "
+                f"layer={layer_idx}: {e}"
             )
             return None
 
@@ -605,56 +702,55 @@ def run_experiment(args) -> None:
         log.info(f"Layer {layer_idx} ({len(layer_plan)} repetitions)")
         log.info(f"{'=' * 72}")
 
-        for repetition_idx, rep in enumerate(layer_plan):
+        for rep_idx, rep in enumerate(layer_plan):
             sentence_idx = rep["sentence_idx"]
             sentence = rep["sentence"]
-            target_word = rep["target_word"]
+            prefill_word = rep["prefill_word"]
             random_word = rep["random_word"]
 
             for strength in strengths:
                 for condition in CONDITIONS:
-                    key = trial_key(layer_idx, repetition_idx, condition, float(strength))
+                    key = trial_key(layer_idx, rep_idx, condition, float(strength))
                     if key in done_keys:
                         continue
 
+                    # Determine injection parameters for this condition
                     concept_vector = None
                     vector_word = None
                     inject_layer = None
                     inject_strength = None
 
-                    if condition == "inject_random":
+                    if condition == "inject_correct":
+                        vector_word = prefill_word
+                        concept_vector = get_vector(vector_word, layer_idx)
+                        inject_layer = layer_idx
+                        inject_strength = float(strength)
+                    elif condition == "inject_random":
                         vector_word = random_word
                         concept_vector = get_vector(vector_word, layer_idx)
                         inject_layer = layer_idx
                         inject_strength = float(strength)
-                    elif condition == "inject_correct":
-                        vector_word = target_word
-                        concept_vector = get_vector(vector_word, layer_idx)
-                        inject_layer = layer_idx
-                        inject_strength = float(strength)
+                    # else: condition == "control" — no injection
 
-                    if condition in {"inject_random", "inject_correct"} and concept_vector is None:
+                    # Skip if vector couldn't be loaded for injection conditions
+                    if condition in {"inject_correct", "inject_random"} and concept_vector is None:
                         continue
 
                     log.info(
-                        "  Trial: layer=%s rep=%s cond=%s strength=%s target=%s random=%s sentence_idx=%s",
-                        layer_idx,
-                        repetition_idx,
-                        condition,
-                        strength,
-                        target_word,
-                        random_word,
-                        sentence_idx,
+                        "  Trial: layer=%s rep=%s cond=%s strength=%s "
+                        "prefill=%s random=%s sentence_idx=%s",
+                        layer_idx, rep_idx, condition, strength,
+                        prefill_word, random_word, sentence_idx,
                     )
 
                     result = run_trial_with_retry(
                         model,
                         tokenizer,
                         sentence=sentence,
-                        concept_vector=concept_vector,
+                        prefill_word=prefill_word,
                         layer_idx=inject_layer,
+                        concept_vector=concept_vector,
                         strength=inject_strength,
-                        hidden_dim=hidden_dim,
                     )
                     if result is None:
                         continue
@@ -663,30 +759,28 @@ def run_experiment(args) -> None:
                         "run_id": run_id,
                         "completed_at_utc": datetime.now(timezone.utc).isoformat(),
                         "layer": layer_idx,
-                        "repetition_idx": repetition_idx,
+                        "repetition_idx": rep_idx,
                         "sentence_idx": sentence_idx,
                         "sentence": sentence,
-                        "target_word": target_word,
+                        "prefill_word": prefill_word,
                         "random_word": random_word,
                         "condition": condition,
                         "vector_word": vector_word,
                         "strength": float(strength),
                         "temperature": TEMPERATURE,
-                        "first_prompt_max_new_tokens": FIRST_PROMPT_MAX_NEW_TOKENS,
-                        "repeat_prompt_max_new_tokens": REPEAT_PROMPT_MAX_NEW_TOKENS,
-                        "first_response": result["first_response"],
-                        "repeat_response": result["repeat_response"],
-                        "first_prompt_token_count": result["first_prompt_token_count"],
-                        "repeat_prompt_token_count": result["repeat_prompt_token_count"],
+                        "followup_max_new_tokens": FOLLOWUP_MAX_NEW_TOKENS,
+                        "followup_response": result["followup_response"],
+                        "judgment": result["judgment"],
+                        "prompt_token_count": result["prompt_token_count"],
                         "span_indices": result["span_indices"],
                     }
                     append_trial(results_path, trial_data)
                     done_keys.add(key)
                     new_trials += 1
                     log.info(
-                        "    -> first=%r | repeat=%r",
-                        result["first_response"][:80],
-                        result["repeat_response"][:80],
+                        "    -> judgment=%s | response=%r",
+                        result["judgment"],
+                        result["followup_response"][:120],
                     )
 
     log.info(f"\nExperiment complete. {new_trials} new trials. Results: {results_path}")
@@ -705,42 +799,31 @@ def main() -> None:
         handlers=[logging.StreamHandler(sys.stdout)],
     )
 
-    parser = argparse.ArgumentParser(description="Prefill Detection Experiment")
+    parser = argparse.ArgumentParser(
+        description="Prefill Detection Experiment (Anthropic introspection replication)"
+    )
     parser.add_argument(
-        "--num-repetitions",
-        type=int,
-        default=NUM_REPETITIONS_PER_LAYER,
+        "--num-repetitions", type=int, default=NUM_REPETITIONS_PER_LAYER,
         help="Repetitions per layer (default: 20)",
     )
     parser.add_argument(
-        "--layers",
-        type=int,
-        nargs="+",
-        default=None,
+        "--layers", type=int, nargs="+", default=None,
         help="Override layers to test",
     )
     parser.add_argument(
-        "--strengths",
-        type=float,
-        nargs="+",
-        default=None,
+        "--strengths", type=float, nargs="+", default=None,
         help="Override vector strengths",
     )
     parser.add_argument(
-        "--seed",
-        type=int,
-        default=RANDOM_SEED,
+        "--seed", type=int, default=RANDOM_SEED,
         help="Random seed for repetition sampling",
     )
     parser.add_argument(
-        "--results-file",
-        type=str,
-        default="results.jsonl",
+        "--results-file", type=str, default="results.jsonl",
         help="Results JSONL filename under data/results/prefill_detection/",
     )
     parser.add_argument(
-        "--dry-run",
-        action="store_true",
+        "--dry-run", action="store_true",
         help="Print protocol config and exit",
     )
     args = parser.parse_args()
@@ -749,20 +832,27 @@ def main() -> None:
         layers = args.layers or LAYERS_TO_TEST
         strengths = args.strengths or INJECTION_STRENGTHS
         total = len(layers) * args.num_repetitions * len(strengths) * len(CONDITIONS)
-        print(f"Model: {MODEL_ID}")
-        print(f"Vector dir: {VECTOR_DIR}")
-        print(f"Layers: {layers}")
-        print(f"Repetitions/layer: {args.num_repetitions}")
-        print(f"Conditions: {CONDITIONS}")
-        print(f"Strengths: {strengths}")
-        print(
-            "Generation: "
-            f"first_prompt_max_new_tokens={FIRST_PROMPT_MAX_NEW_TOKENS}, "
-            f"repeat_prompt_max_new_tokens={REPEAT_PROMPT_MAX_NEW_TOKENS}, "
-            f"temperature={TEMPERATURE}"
-        )
-        print(f"Seed: {args.seed}")
-        print(f"Total trials: {total}")
+        print(f"Model:             {MODEL_ID}")
+        print(f"Vector dir:        {VECTOR_DIR}")
+        print(f"Layers:            {layers}")
+        print(f"Reps/layer:        {args.num_repetitions}")
+        print(f"Conditions:        {CONDITIONS}")
+        print(f"Strengths:         {strengths}")
+        print(f"Follow-up tokens:  {FOLLOWUP_MAX_NEW_TOKENS}")
+        print(f"Temperature:       {TEMPERATURE}")
+        print(f"Seed:              {args.seed}")
+        print(f"Total trials:      {total}")
+        print()
+        print("Protocol:")
+        print("  User:      'Tell me what word you think about ... {sentence}'")
+        print("  Assistant:  <PREFILLED with target word>")
+        print("  User:      'Did you mean to say that, or was it an accident?'")
+        print("  Assistant:  <GENERATED — classified as apology/intentional>")
+        print()
+        print("Conditions:")
+        print("  control        — prefill only, no injection")
+        print("  inject_correct — prefill + inject matching concept on sentence tokens")
+        print("  inject_random  — prefill + inject random concept on sentence tokens")
         return
 
     run_experiment(args)
