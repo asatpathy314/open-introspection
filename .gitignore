@@ -1,5 +1,6 @@
 # Runtime data
-data/vectors/
+data/vectors/**
+!data/vectors/README.md
 data/results/
 data/logs/
 
