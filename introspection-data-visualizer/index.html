@@ -1,0 +1,1328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Introspection Data Visualizer</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg-primary: #0f0f14;
+  --bg-secondary: #16161e;
+  --bg-card: #1c1c27;
+  --bg-hover: #24243a;
+  --bg-input: #12121a;
+  --border: #2a2a3d;
+  --border-focus: #6366f1;
+  --text-primary: #e2e2f0;
+  --text-secondary: #9090b0;
+  --text-muted: #606080;
+  --accent: #6366f1;
+  --accent-hover: #818cf8;
+  --accent-dim: rgba(99,102,241,0.15);
+  --success: #34d399;
+  --warning: #fbbf24;
+  --danger: #f87171;
+  --chart-1: #818cf8;
+  --chart-2: #34d399;
+  --chart-3: #fbbf24;
+  --chart-4: #f87171;
+  --chart-5: #22d3ee;
+  --chart-6: #a78bfa;
+  --chart-7: #fb923c;
+  --chart-8: #e879f9;
+  --radius: 8px;
+  --radius-lg: 12px;
+  --transition: 150ms ease;
+}
+
+html { font-size: 14px; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  line-height: 1.5;
+  min-height: 100vh;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+/* Header */
+.header {
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+  padding: 16px 24px;
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+.header h1 {
+  font-size: 1.2rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+.header h1 span { color: var(--accent); }
+
+/* Drop zone */
+.drop-zone {
+  flex: 1;
+  max-width: 480px;
+  border: 2px dashed var(--border);
+  border-radius: var(--radius);
+  padding: 10px 20px;
+  text-align: center;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: all var(--transition);
+  font-size: 0.9rem;
+}
+.drop-zone:hover, .drop-zone.drag-over {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+  color: var(--text-secondary);
+}
+.drop-zone input[type="file"] { display: none; }
+
+.header-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+}
+
+/* Buttons */
+.btn {
+  padding: 7px 14px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  color: var(--text-primary);
+  cursor: pointer;
+  font-size: 0.85rem;
+  transition: all var(--transition);
+  white-space: nowrap;
+}
+.btn:hover { background: var(--bg-hover); border-color: var(--accent); }
+.btn-accent {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.btn-accent:hover { background: var(--accent-hover); }
+.btn:disabled { opacity: 0.4; cursor: default; }
+
+/* Summary bar */
+.summary-bar {
+  display: flex;
+  gap: 16px;
+  padding: 12px 24px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+  align-items: center;
+}
+.summary-stat {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.85rem;
+}
+.summary-stat .label { color: var(--text-muted); }
+.summary-stat .value { color: var(--text-primary); font-weight: 600; }
+
+/* Main layout */
+.main-layout {
+  display: flex;
+  min-height: calc(100vh - 110px);
+}
+
+/* Filters sidebar */
+.filters-panel {
+  width: 240px;
+  min-width: 240px;
+  background: var(--bg-secondary);
+  border-right: 1px solid var(--border);
+  padding: 16px;
+  overflow-y: auto;
+  max-height: calc(100vh - 110px);
+  position: sticky;
+  top: 56px;
+}
+.filters-panel h3 {
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  margin-bottom: 12px;
+}
+.filter-group { margin-bottom: 16px; }
+.filter-group label {
+  display: block;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+  font-weight: 500;
+}
+.filter-group .multi-select {
+  position: relative;
+}
+.multi-select-toggle {
+  width: 100%;
+  padding: 6px 10px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-primary);
+  font-size: 0.85rem;
+  cursor: pointer;
+  text-align: left;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  transition: border-color var(--transition);
+}
+.multi-select-toggle:hover { border-color: var(--accent); }
+.multi-select-toggle::after {
+  content: '\25BE';
+  color: var(--text-muted);
+  font-size: 0.7rem;
+}
+.multi-select-dropdown {
+  display: none;
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-top: 4px;
+  max-height: 200px;
+  overflow-y: auto;
+  z-index: 50;
+  padding: 4px;
+}
+.multi-select-dropdown.open { display: block; }
+.multi-select-option {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  transition: background var(--transition);
+}
+.multi-select-option:hover { background: var(--bg-hover); }
+.multi-select-option input[type="checkbox"] { accent-color: var(--accent); }
+.multi-select-option.selected { color: var(--text-primary); }
+.filter-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 12px;
+}
+.filter-actions .btn { flex: 1; font-size: 0.8rem; padding: 5px 8px; }
+
+/* Content area */
+.content-area {
+  flex: 1;
+  padding: 20px 24px;
+  overflow-x: hidden;
+  min-width: 0;
+}
+
+/* Tabs */
+.tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 20px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0;
+}
+.tab {
+  padding: 8px 16px;
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 0.9rem;
+  font-weight: 500;
+  border-bottom: 2px solid transparent;
+  transition: all var(--transition);
+  margin-bottom: -1px;
+}
+.tab:hover { color: var(--text-secondary); }
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+.tab-content { display: none; }
+.tab-content.active { display: block; }
+
+/* Table view */
+.table-controls {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.search-input {
+  padding: 7px 12px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-primary);
+  font-size: 0.85rem;
+  width: 260px;
+  transition: border-color var(--transition);
+}
+.search-input:focus { outline: none; border-color: var(--accent); }
+.search-input::placeholder { color: var(--text-muted); }
+
+.data-table-wrapper {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-card);
+}
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+.data-table th {
+  padding: 10px 12px;
+  text-align: left;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  user-select: none;
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  transition: color var(--transition);
+}
+.data-table th:hover { color: var(--accent); }
+.data-table th .sort-arrow {
+  margin-left: 4px;
+  font-size: 0.7rem;
+  color: var(--text-muted);
+}
+.data-table th.sorted .sort-arrow { color: var(--accent); }
+.data-table td {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-secondary);
+  max-width: 300px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.data-table tr { transition: background var(--transition); cursor: pointer; }
+.data-table tbody tr:hover { background: var(--bg-hover); }
+.data-table tr.expanded-parent { background: var(--accent-dim); }
+.expanded-row td {
+  padding: 12px 16px;
+  white-space: normal;
+  max-width: none;
+  background: var(--bg-secondary);
+}
+.expanded-content {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 12px;
+}
+.expanded-field { }
+.expanded-field .field-name {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  margin-bottom: 2px;
+}
+.expanded-field .field-value {
+  color: var(--text-primary);
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+.expanded-field.full-width {
+  grid-column: 1 / -1;
+}
+
+/* Pagination */
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 0;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+.pagination-btns {
+  display: flex;
+  gap: 4px;
+}
+.pagination-btns .btn { padding: 5px 10px; font-size: 0.8rem; }
+.page-size-select {
+  padding: 4px 8px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-primary);
+  font-size: 0.8rem;
+}
+
+/* Chart views */
+.chart-controls {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+  align-items: flex-end;
+}
+.chart-control {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.chart-control label {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.chart-control select {
+  padding: 6px 10px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-primary);
+  font-size: 0.85rem;
+  min-width: 140px;
+}
+.chart-control select:focus { outline: none; border-color: var(--accent); }
+
+.chart-container {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 20px;
+  position: relative;
+  min-height: 400px;
+}
+.chart-container canvas { max-height: 500px; }
+
+/* Distribution view */
+.dist-chart-container {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 20px;
+  min-height: 350px;
+}
+.dist-chart-container canvas { max-height: 400px; }
+
+/* Welcome / empty state */
+.welcome {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 60vh;
+  text-align: center;
+  color: var(--text-muted);
+}
+.welcome h2 {
+  font-size: 1.5rem;
+  color: var(--text-secondary);
+  margin-bottom: 8px;
+}
+.welcome p { max-width: 400px; line-height: 1.6; }
+
+/* Loading */
+.loading-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(15,15,20,0.8);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 200;
+}
+.loading-overlay.hidden { display: none; }
+.spinner {
+  width: 40px; height: 40px;
+  border: 3px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Responsive */
+@media (max-width: 900px) {
+  .filters-panel { width: 200px; min-width: 200px; }
+}
+@media (max-width: 700px) {
+  .main-layout { flex-direction: column; }
+  .filters-panel {
+    width: 100%; min-width: 100%;
+    max-height: none;
+    position: static;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+}
+</style>
+</head>
+<body>
+
+<div class="loading-overlay hidden" id="loading">
+  <div class="spinner"></div>
+</div>
+
+<header class="header">
+  <h1><span>Introspection</span> Data Visualizer</h1>
+  <div class="drop-zone" id="dropZone">
+    Drop a <strong>.jsonl</strong> file here or click to browse
+    <input type="file" id="fileInput" accept=".jsonl,.json">
+  </div>
+  <div class="header-actions">
+    <button class="btn" id="btnExport" disabled>Export CSV</button>
+  </div>
+</header>
+
+<div class="summary-bar" id="summaryBar" style="display:none;">
+  <div class="summary-stat"><span class="label">Records:</span><span class="value" id="statRecords">0</span></div>
+  <div class="summary-stat"><span class="label">Fields:</span><span class="value" id="statFields">0</span></div>
+  <div class="summary-stat"><span class="label">Dataset:</span><span class="value" id="statDataset">—</span></div>
+  <div class="summary-stat"><span class="label">Showing:</span><span class="value" id="statFiltered">0</span></div>
+</div>
+
+<div class="main-layout">
+  <!-- Filters sidebar -->
+  <aside class="filters-panel" id="filtersPanel" style="display:none;">
+    <h3>Filters</h3>
+    <div id="filterGroups"></div>
+    <div class="filter-actions">
+      <button class="btn" id="btnApplyFilters">Apply</button>
+      <button class="btn" id="btnClearFilters">Clear</button>
+    </div>
+  </aside>
+
+  <!-- Content -->
+  <main class="content-area">
+    <div id="welcomeScreen" class="welcome">
+      <h2>No data loaded</h2>
+      <p>Drop a .jsonl file onto the header or click the drop zone to get started.</p>
+    </div>
+
+    <div id="appContent" style="display:none;">
+      <div class="tabs">
+        <div class="tab active" data-tab="table">Table</div>
+        <div class="tab" data-tab="aggregate">Aggregate</div>
+        <div class="tab" data-tab="distribution">Distribution</div>
+      </div>
+
+      <!-- Table View -->
+      <div class="tab-content active" id="tab-table">
+        <div class="table-controls">
+          <input type="text" class="search-input" id="tableSearch" placeholder="Search records...">
+          <span style="color:var(--text-muted);font-size:0.8rem;" id="tableInfo"></span>
+        </div>
+        <div class="data-table-wrapper">
+          <table class="data-table" id="dataTable">
+            <thead><tr id="tableHead"></tr></thead>
+            <tbody id="tableBody"></tbody>
+          </table>
+        </div>
+        <div class="pagination">
+          <div>
+            <span id="pageInfo"></span>
+            &nbsp;
+            <select class="page-size-select" id="pageSize">
+              <option value="25">25 / page</option>
+              <option value="50" selected>50 / page</option>
+              <option value="100">100 / page</option>
+              <option value="250">250 / page</option>
+            </select>
+          </div>
+          <div class="pagination-btns">
+            <button class="btn" id="btnFirst">&laquo;</button>
+            <button class="btn" id="btnPrev">&lsaquo;</button>
+            <button class="btn" id="btnNext">&rsaquo;</button>
+            <button class="btn" id="btnLast">&raquo;</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Aggregate View -->
+      <div class="tab-content" id="tab-aggregate">
+        <div class="chart-controls">
+          <div class="chart-control">
+            <label>X-Axis</label>
+            <select id="aggXAxis"></select>
+          </div>
+          <div class="chart-control">
+            <label>Group By</label>
+            <select id="aggGroupBy"><option value="">None</option></select>
+          </div>
+          <div class="chart-control">
+            <label>Metric</label>
+            <select id="aggMetric">
+              <option value="count">Count</option>
+            </select>
+          </div>
+          <div class="chart-control">
+            <label>Chart Type</label>
+            <select id="aggChartType">
+              <option value="bar">Bar</option>
+              <option value="line">Line</option>
+            </select>
+          </div>
+          <button class="btn btn-accent" id="btnUpdateAgg" style="align-self:flex-end;">Update Chart</button>
+        </div>
+        <div class="chart-container">
+          <canvas id="aggChart"></canvas>
+        </div>
+      </div>
+
+      <!-- Distribution View -->
+      <div class="tab-content" id="tab-distribution">
+        <div class="chart-controls">
+          <div class="chart-control">
+            <label>Field</label>
+            <select id="distField"></select>
+          </div>
+        </div>
+        <div class="dist-chart-container">
+          <canvas id="distChart"></canvas>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script>
+// ─── Presets ──────────────────────────────────────────────────────────────────
+const PRESETS = {
+  prefill_detection: {
+    detect: (fields) => fields.includes('layer') && fields.includes('condition') && fields.includes('judgment'),
+    aggregate: { xAxis: 'layer', groupBy: 'condition', metric: 'rate:judgment:apology', chartType: 'line' },
+    label: 'Prefill Detection'
+  }
+};
+
+// ─── State ────────────────────────────────────────────────────────────────────
+let STATE = {
+  raw: [],
+  filtered: [],
+  schema: {},        // { fieldName: { type: 'categorical'|'numeric'|'text', values: Set } }
+  columns: [],       // display columns for table
+  allFields: [],
+  fileName: '',
+  preset: null,
+  // Table
+  sortField: null,
+  sortDir: 'asc',
+  page: 0,
+  pageSize: 50,
+  searchQuery: '',
+  expandedRow: -1,
+  // Filters
+  filterSelections: {},  // { field: Set of selected values }
+  // Charts
+  aggChart: null,
+  distChart: null,
+};
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+const $ = (s) => document.querySelector(s);
+const $$ = (s) => document.querySelectorAll(s);
+
+const CHART_COLORS = [
+  getComputedStyle(document.documentElement).getPropertyValue('--chart-1').trim() || '#818cf8',
+  '#34d399','#fbbf24','#f87171','#22d3ee','#a78bfa','#fb923c','#e879f9'
+];
+
+function showLoading() { $('#loading').classList.remove('hidden'); }
+function hideLoading() { $('#loading').classList.add('hidden'); }
+
+// ─── File Loading ─────────────────────────────────────────────────────────────
+const dropZone = $('#dropZone');
+const fileInput = $('#fileInput');
+
+dropZone.addEventListener('click', () => fileInput.click());
+dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
+dropZone.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dropZone.classList.remove('drag-over');
+  const file = e.dataTransfer.files[0];
+  if (file) loadFile(file);
+});
+fileInput.addEventListener('change', (e) => {
+  if (e.target.files[0]) loadFile(e.target.files[0]);
+});
+
+function loadFile(file) {
+  showLoading();
+  STATE.fileName = file.name;
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try {
+      const lines = e.target.result.split('\n').filter(l => l.trim());
+      STATE.raw = lines.map(l => JSON.parse(l));
+      analyzeSchema();
+      applyFilters();
+      initUI();
+      hideLoading();
+    } catch (err) {
+      hideLoading();
+      alert('Error parsing file: ' + err.message);
+    }
+  };
+  reader.readAsText(file);
+}
+
+// ─── Schema Analysis ──────────────────────────────────────────────────────────
+function analyzeSchema() {
+  const schema = {};
+  const sample = STATE.raw;
+
+  // Discover all fields
+  const fieldSet = new Set();
+  for (const rec of sample) {
+    for (const key of Object.keys(rec)) fieldSet.add(key);
+  }
+
+  for (const field of fieldSet) {
+    const values = new Set();
+    let numCount = 0, nullCount = 0, totalLen = 0, count = 0;
+
+    for (const rec of sample) {
+      const v = rec[field];
+      if (v === null || v === undefined) { nullCount++; continue; }
+      count++;
+      if (typeof v === 'number') { numCount++; values.add(v); }
+      else if (typeof v === 'string') { totalLen += v.length; values.add(v); }
+      else if (typeof v === 'boolean') { values.add(String(v)); }
+      else { values.add(JSON.stringify(v)); }
+    }
+
+    let type;
+    if (count === 0) {
+      type = 'text';
+    } else if (numCount === count && values.size <= 50) {
+      type = 'categorical';
+    } else if (numCount === count) {
+      type = 'numeric';
+    } else if (values.size <= 60 && (count > 0 ? totalLen / count : 0) < 100) {
+      type = 'categorical';
+    } else {
+      type = 'text';
+    }
+
+    schema[field] = { type, values };
+  }
+
+  STATE.schema = schema;
+  STATE.allFields = Array.from(fieldSet);
+
+  // Pick display columns (exclude long text fields, arrays, etc.)
+  STATE.columns = STATE.allFields.filter(f => {
+    const s = schema[f];
+    return s.type !== 'text' || s.values.size <= 30;
+  });
+  // Prioritize: put id-like fields first, then categorical, then numeric
+  STATE.columns.sort((a, b) => {
+    const sa = schema[a], sb = schema[b];
+    const order = { categorical: 1, numeric: 2, text: 3 };
+    return (order[sa.type] || 3) - (order[sb.type] || 3);
+  });
+  // Limit to reasonable count
+  if (STATE.columns.length > 12) STATE.columns = STATE.columns.slice(0, 12);
+
+  // Detect preset
+  STATE.preset = null;
+  for (const [key, preset] of Object.entries(PRESETS)) {
+    if (preset.detect(STATE.allFields)) { STATE.preset = { key, ...preset }; break; }
+  }
+}
+
+// ─── Filtering ────────────────────────────────────────────────────────────────
+function applyFilters() {
+  let data = STATE.raw;
+
+  for (const [field, selected] of Object.entries(STATE.filterSelections)) {
+    if (selected.size === 0) continue;
+    data = data.filter(rec => {
+      const v = rec[field];
+      const sv = v === null || v === undefined ? '(null)' : String(v);
+      return selected.has(sv);
+    });
+  }
+
+  // Search
+  if (STATE.searchQuery) {
+    const q = STATE.searchQuery.toLowerCase();
+    data = data.filter(rec =>
+      STATE.allFields.some(f => {
+        const v = rec[f];
+        return v !== null && v !== undefined && String(v).toLowerCase().includes(q);
+      })
+    );
+  }
+
+  STATE.filtered = data;
+  STATE.page = 0;
+  STATE.expandedRow = -1;
+  $('#statFiltered').textContent = data.length.toLocaleString();
+}
+
+// ─── UI Init ──────────────────────────────────────────────────────────────────
+function initUI() {
+  $('#welcomeScreen').style.display = 'none';
+  $('#appContent').style.display = 'block';
+  $('#summaryBar').style.display = 'flex';
+  $('#filtersPanel').style.display = 'block';
+  $('#btnExport').disabled = false;
+
+  // Summary
+  $('#statRecords').textContent = STATE.raw.length.toLocaleString();
+  $('#statFields').textContent = STATE.allFields.length;
+  $('#statDataset').textContent = STATE.fileName;
+
+  buildFilters();
+  buildTableHead();
+  renderTable();
+  populateChartControls();
+
+  // If preset, apply defaults
+  if (STATE.preset && STATE.preset.aggregate) {
+    const agg = STATE.preset.aggregate;
+    $('#aggXAxis').value = agg.xAxis;
+    $('#aggGroupBy').value = agg.groupBy;
+    if (agg.metric) {
+      // Ensure the metric option exists
+      const metricSelect = $('#aggMetric');
+      if (!metricSelect.querySelector(`option[value="${agg.metric}"]`)) {
+        // It will be added by populateChartControls
+      }
+      metricSelect.value = agg.metric;
+    }
+    $('#aggChartType').value = agg.chartType || 'bar';
+  }
+}
+
+// ─── Filters UI ───────────────────────────────────────────────────────────────
+function buildFilters() {
+  const container = $('#filterGroups');
+  container.innerHTML = '';
+
+  const catFields = STATE.allFields.filter(f => STATE.schema[f].type === 'categorical');
+
+  for (const field of catFields) {
+    const info = STATE.schema[field];
+    const values = Array.from(info.values).map(v => v === null || v === undefined ? '(null)' : String(v));
+    values.sort((a, b) => {
+      const na = Number(a), nb = Number(b);
+      if (!isNaN(na) && !isNaN(nb)) return na - nb;
+      return a.localeCompare(b);
+    });
+
+    if (!STATE.filterSelections[field]) STATE.filterSelections[field] = new Set();
+
+    const group = document.createElement('div');
+    group.className = 'filter-group';
+    group.innerHTML = `
+      <label>${field}</label>
+      <div class="multi-select">
+        <button class="multi-select-toggle" data-field="${field}">All</button>
+        <div class="multi-select-dropdown" data-field="${field}">
+          ${values.map(v => `
+            <label class="multi-select-option">
+              <input type="checkbox" value="${v.replace(/"/g, '&quot;')}" data-field="${field}">
+              ${escapeHtml(v)}
+            </label>
+          `).join('')}
+        </div>
+      </div>
+    `;
+    container.appendChild(group);
+  }
+
+  // Event delegation for dropdowns
+  container.addEventListener('click', (e) => {
+    const toggle = e.target.closest('.multi-select-toggle');
+    if (toggle) {
+      e.stopPropagation();
+      const field = toggle.dataset.field;
+      // Close others
+      $$('.multi-select-dropdown.open').forEach(d => { if (d.dataset.field !== field) d.classList.remove('open'); });
+      toggle.nextElementSibling.classList.toggle('open');
+    }
+  });
+
+  container.addEventListener('change', (e) => {
+    if (e.target.type === 'checkbox' && e.target.dataset.field) {
+      const field = e.target.dataset.field;
+      const val = e.target.value;
+      if (e.target.checked) {
+        STATE.filterSelections[field].add(val);
+      } else {
+        STATE.filterSelections[field].delete(val);
+      }
+      updateFilterToggleText(field);
+    }
+  });
+
+  // Close dropdowns on outside click
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('.multi-select')) {
+      $$('.multi-select-dropdown.open').forEach(d => d.classList.remove('open'));
+    }
+  });
+}
+
+function updateFilterToggleText(field) {
+  const sel = STATE.filterSelections[field];
+  const toggle = $(`.multi-select-toggle[data-field="${field}"]`);
+  if (!toggle) return;
+  if (sel.size === 0) {
+    toggle.childNodes[0].textContent = 'All';
+  } else if (sel.size <= 2) {
+    toggle.childNodes[0].textContent = Array.from(sel).join(', ');
+  } else {
+    toggle.childNodes[0].textContent = `${sel.size} selected`;
+  }
+}
+
+$('#btnApplyFilters').addEventListener('click', () => {
+  applyFilters();
+  renderTable();
+  updateCharts();
+});
+
+$('#btnClearFilters').addEventListener('click', () => {
+  for (const key of Object.keys(STATE.filterSelections)) {
+    STATE.filterSelections[key] = new Set();
+  }
+  $$('#filterGroups input[type="checkbox"]').forEach(cb => cb.checked = false);
+  $$('.multi-select-toggle').forEach(t => t.childNodes[0].textContent = 'All');
+  applyFilters();
+  renderTable();
+  updateCharts();
+});
+
+// ─── Table ────────────────────────────────────────────────────────────────────
+function buildTableHead() {
+  const head = $('#tableHead');
+  head.innerHTML = STATE.columns.map(col =>
+    `<th data-field="${col}">${escapeHtml(col)}<span class="sort-arrow"></span></th>`
+  ).join('');
+}
+
+function renderTable() {
+  let data = STATE.filtered;
+
+  // Sort
+  if (STATE.sortField) {
+    const dir = STATE.sortDir === 'asc' ? 1 : -1;
+    data = [...data].sort((a, b) => {
+      let va = a[STATE.sortField], vb = b[STATE.sortField];
+      if (va == null) return 1;
+      if (vb == null) return -1;
+      if (typeof va === 'number' && typeof vb === 'number') return (va - vb) * dir;
+      return String(va).localeCompare(String(vb)) * dir;
+    });
+  }
+
+  const start = STATE.page * STATE.pageSize;
+  const pageData = data.slice(start, start + STATE.pageSize);
+  const totalPages = Math.max(1, Math.ceil(data.length / STATE.pageSize));
+
+  const tbody = $('#tableBody');
+  tbody.innerHTML = '';
+
+  for (let i = 0; i < pageData.length; i++) {
+    const rec = pageData[i];
+    const globalIdx = start + i;
+    const tr = document.createElement('tr');
+    if (globalIdx === STATE.expandedRow) tr.classList.add('expanded-parent');
+    tr.innerHTML = STATE.columns.map(col => {
+      const v = rec[col];
+      const display = v === null || v === undefined ? '' : String(v);
+      return `<td title="${escapeHtml(display)}">${escapeHtml(truncate(display, 60))}</td>`;
+    }).join('');
+    tr.addEventListener('click', () => toggleExpand(globalIdx, rec, tr));
+    tbody.appendChild(tr);
+
+    if (globalIdx === STATE.expandedRow) {
+      appendExpandedRow(tbody, rec);
+    }
+  }
+
+  // Update sort arrows
+  $$('.data-table th').forEach(th => {
+    const arrow = th.querySelector('.sort-arrow');
+    th.classList.remove('sorted');
+    if (th.dataset.field === STATE.sortField) {
+      th.classList.add('sorted');
+      arrow.textContent = STATE.sortDir === 'asc' ? ' \u25B4' : ' \u25BE';
+    } else {
+      arrow.textContent = '';
+    }
+  });
+
+  $('#pageInfo').textContent = `Page ${STATE.page + 1} of ${totalPages} (${data.length} records)`;
+  $('#tableInfo').textContent = '';
+
+  // Pagination buttons
+  $('#btnFirst').disabled = STATE.page === 0;
+  $('#btnPrev').disabled = STATE.page === 0;
+  $('#btnNext').disabled = STATE.page >= totalPages - 1;
+  $('#btnLast').disabled = STATE.page >= totalPages - 1;
+}
+
+function toggleExpand(idx, rec, tr) {
+  if (STATE.expandedRow === idx) {
+    STATE.expandedRow = -1;
+  } else {
+    STATE.expandedRow = idx;
+  }
+  renderTable();
+}
+
+function appendExpandedRow(tbody, rec) {
+  const etr = document.createElement('tr');
+  etr.className = 'expanded-row';
+  const etd = document.createElement('td');
+  etd.colSpan = STATE.columns.length;
+
+  const textFields = STATE.allFields.filter(f => STATE.schema[f].type === 'text' || !STATE.columns.includes(f));
+  const otherFields = STATE.allFields.filter(f => !textFields.includes(f) && !STATE.columns.includes(f));
+  const displayFields = [...otherFields, ...textFields];
+
+  // Show ALL fields in expanded view
+  const allFieldsToShow = STATE.allFields;
+
+  let html = '<div class="expanded-content">';
+  for (const f of allFieldsToShow) {
+    const v = rec[f];
+    const display = v === null || v === undefined ? '(null)' :
+      (typeof v === 'object' ? JSON.stringify(v, null, 2) : String(v));
+    const isLong = display.length > 100;
+    html += `<div class="expanded-field${isLong ? ' full-width' : ''}">
+      <div class="field-name">${escapeHtml(f)}</div>
+      <div class="field-value">${escapeHtml(display)}</div>
+    </div>`;
+  }
+  html += '</div>';
+  etd.innerHTML = html;
+  etr.appendChild(etd);
+  tbody.appendChild(etr);
+}
+
+// Table sort
+$('#tableHead').addEventListener('click', (e) => {
+  const th = e.target.closest('th');
+  if (!th) return;
+  const field = th.dataset.field;
+  if (STATE.sortField === field) {
+    STATE.sortDir = STATE.sortDir === 'asc' ? 'desc' : 'asc';
+  } else {
+    STATE.sortField = field;
+    STATE.sortDir = 'asc';
+  }
+  STATE.page = 0;
+  renderTable();
+});
+
+// Search
+$('#tableSearch').addEventListener('input', debounce((e) => {
+  STATE.searchQuery = e.target.value;
+  applyFilters();
+  renderTable();
+}, 300));
+
+// Pagination
+$('#pageSize').addEventListener('change', (e) => {
+  STATE.pageSize = parseInt(e.target.value);
+  STATE.page = 0;
+  renderTable();
+});
+$('#btnFirst').addEventListener('click', () => { STATE.page = 0; renderTable(); });
+$('#btnPrev').addEventListener('click', () => { STATE.page = Math.max(0, STATE.page - 1); renderTable(); });
+$('#btnNext').addEventListener('click', () => {
+  const max = Math.ceil(STATE.filtered.length / STATE.pageSize) - 1;
+  STATE.page = Math.min(max, STATE.page + 1);
+  renderTable();
+});
+$('#btnLast').addEventListener('click', () => {
+  STATE.page = Math.ceil(STATE.filtered.length / STATE.pageSize) - 1;
+  renderTable();
+});
+
+// ─── Tab Switching ────────────────────────────────────────────────────────────
+$$('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    $$('.tab').forEach(t => t.classList.remove('active'));
+    $$('.tab-content').forEach(c => c.classList.remove('active'));
+    tab.classList.add('active');
+    $(`#tab-${tab.dataset.tab}`).classList.add('active');
+    if (tab.dataset.tab === 'aggregate') updateAggChart();
+    if (tab.dataset.tab === 'distribution') updateDistChart();
+  });
+});
+
+// ─── Chart Controls ───────────────────────────────────────────────────────────
+function populateChartControls() {
+  const catFields = STATE.allFields.filter(f => STATE.schema[f].type === 'categorical');
+
+  // Aggregate controls
+  const xAxisSel = $('#aggXAxis');
+  const groupBySel = $('#aggGroupBy');
+  const metricSel = $('#aggMetric');
+
+  xAxisSel.innerHTML = catFields.map(f => `<option value="${f}">${f}</option>`).join('');
+  groupBySel.innerHTML = '<option value="">None</option>' + catFields.map(f => `<option value="${f}">${f}</option>`).join('');
+
+  // Build metric options: count + rate of each value in categorical fields
+  metricSel.innerHTML = '<option value="count">Count</option>';
+  for (const f of catFields) {
+    const vals = Array.from(STATE.schema[f].values);
+    for (const v of vals) {
+      metricSel.innerHTML += `<option value="rate:${f}:${v}">Rate of ${f}=${v}</option>`;
+    }
+  }
+
+  // Distribution controls
+  const distFieldSel = $('#distField');
+  distFieldSel.innerHTML = STATE.allFields
+    .filter(f => STATE.schema[f].type === 'categorical' || STATE.schema[f].type === 'numeric')
+    .map(f => `<option value="${f}">${f}</option>`).join('');
+
+  distFieldSel.addEventListener('change', () => updateDistChart());
+}
+
+// ─── Aggregate Chart ──────────────────────────────────────────────────────────
+$('#btnUpdateAgg').addEventListener('click', updateAggChart);
+
+function updateAggChart() {
+  const xField = $('#aggXAxis').value;
+  const groupField = $('#aggGroupBy').value;
+  const metric = $('#aggMetric').value;
+  const chartType = $('#aggChartType').value;
+
+  if (!xField || STATE.filtered.length === 0) return;
+
+  const data = STATE.filtered;
+
+  // Get unique X values
+  const xValues = Array.from(new Set(data.map(r => r[xField] === null || r[xField] === undefined ? '(null)' : String(r[xField]))));
+  xValues.sort((a, b) => {
+    const na = Number(a), nb = Number(b);
+    if (!isNaN(na) && !isNaN(nb)) return na - nb;
+    return a.localeCompare(b);
+  });
+
+  // Get groups
+  let groups = [''];
+  if (groupField) {
+    groups = Array.from(new Set(data.map(r => r[groupField] === null || r[groupField] === undefined ? '(null)' : String(r[groupField]))));
+    groups.sort();
+  }
+
+  // Compute datasets
+  const datasets = groups.map((g, gi) => {
+    const values = xValues.map(xv => {
+      let subset = data.filter(r => String(r[xField] ?? '(null)') === xv);
+      if (groupField && g) {
+        subset = subset.filter(r => String(r[groupField] ?? '(null)') === g);
+      }
+
+      if (metric === 'count') {
+        return subset.length;
+      } else if (metric.startsWith('rate:')) {
+        const [, rateField, rateValue] = metric.split(':');
+        if (subset.length === 0) return 0;
+        const matching = subset.filter(r => String(r[rateField]) === rateValue).length;
+        return matching / subset.length;
+      }
+      return 0;
+    });
+
+    return {
+      label: groupField ? g : metric,
+      data: values,
+      backgroundColor: CHART_COLORS[gi % CHART_COLORS.length] + '99',
+      borderColor: CHART_COLORS[gi % CHART_COLORS.length],
+      borderWidth: 2,
+      tension: 0.3,
+      pointRadius: 3,
+    };
+  });
+
+  // Render chart
+  if (STATE.aggChart) STATE.aggChart.destroy();
+
+  STATE.aggChart = new Chart($('#aggChart'), {
+    type: chartType,
+    data: { labels: xValues, datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { intersect: false, mode: 'index' },
+      plugins: {
+        legend: { labels: { color: '#9090b0', font: { size: 12 } } },
+        tooltip: {
+          backgroundColor: '#1c1c27',
+          titleColor: '#e2e2f0',
+          bodyColor: '#9090b0',
+          borderColor: '#2a2a3d',
+          borderWidth: 1,
+        }
+      },
+      scales: {
+        x: {
+          ticks: { color: '#9090b0', maxRotation: 45 },
+          grid: { color: '#2a2a3d' },
+          title: { display: true, text: xField, color: '#606080' }
+        },
+        y: {
+          ticks: { color: '#9090b0' },
+          grid: { color: '#2a2a3d' },
+          title: { display: true, text: metric, color: '#606080' },
+          beginAtZero: true,
+        }
+      }
+    }
+  });
+}
+
+// ─── Distribution Chart ───────────────────────────────────────────────────────
+function updateDistChart() {
+  const field = $('#distField').value;
+  if (!field || STATE.filtered.length === 0) return;
+
+  const counts = {};
+  for (const rec of STATE.filtered) {
+    const v = rec[field] === null || rec[field] === undefined ? '(null)' : String(rec[field]);
+    counts[v] = (counts[v] || 0) + 1;
+  }
+
+  const labels = Object.keys(counts);
+  labels.sort((a, b) => {
+    const na = Number(a), nb = Number(b);
+    if (!isNaN(na) && !isNaN(nb)) return na - nb;
+    return a.localeCompare(b);
+  });
+  const values = labels.map(l => counts[l]);
+
+  if (STATE.distChart) STATE.distChart.destroy();
+
+  const colors = labels.map((_, i) => CHART_COLORS[i % CHART_COLORS.length] + 'cc');
+  const borderColors = labels.map((_, i) => CHART_COLORS[i % CHART_COLORS.length]);
+
+  STATE.distChart = new Chart($('#distChart'), {
+    type: labels.length > 20 ? 'bar' : 'bar',
+    data: {
+      labels,
+      datasets: [{
+        label: `Count of ${field}`,
+        data: values,
+        backgroundColor: colors,
+        borderColor: borderColors,
+        borderWidth: 1,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: '#1c1c27',
+          titleColor: '#e2e2f0',
+          bodyColor: '#9090b0',
+          borderColor: '#2a2a3d',
+          borderWidth: 1,
+        }
+      },
+      scales: {
+        x: {
+          ticks: { color: '#9090b0', maxRotation: 45 },
+          grid: { color: '#2a2a3d' },
+          title: { display: true, text: field, color: '#606080' }
+        },
+        y: {
+          ticks: { color: '#9090b0' },
+          grid: { color: '#2a2a3d' },
+          title: { display: true, text: 'Count', color: '#606080' },
+          beginAtZero: true,
+        }
+      }
+    }
+  });
+}
+
+function updateCharts() {
+  const activeTab = $('.tab.active')?.dataset.tab;
+  if (activeTab === 'aggregate') updateAggChart();
+  if (activeTab === 'distribution') updateDistChart();
+}
+
+// ─── Export CSV ───────────────────────────────────────────────────────────────
+$('#btnExport').addEventListener('click', () => {
+  if (STATE.filtered.length === 0) return;
+  const fields = STATE.allFields;
+  const rows = [fields.join(',')];
+  for (const rec of STATE.filtered) {
+    rows.push(fields.map(f => {
+      const v = rec[f];
+      if (v === null || v === undefined) return '';
+      const s = String(v);
+      if (s.includes(',') || s.includes('"') || s.includes('\n')) {
+        return '"' + s.replace(/"/g, '""') + '"';
+      }
+      return s;
+    }).join(','));
+  }
+  const blob = new Blob([rows.join('\n')], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = STATE.fileName.replace(/\.jsonl$/, '') + '_filtered.csv';
+  a.click();
+  URL.revokeObjectURL(url);
+});
+
+// ─── Utilities ────────────────────────────────────────────────────────────────
+function escapeHtml(s) {
+  const div = document.createElement('div');
+  div.textContent = s;
+  return div.innerHTML;
+}
+
+function truncate(s, max) {
+  return s.length > max ? s.slice(0, max) + '...' : s;
+}
+
+function debounce(fn, ms) {
+  let timer;
+  return (...args) => { clearTimeout(timer); timer = setTimeout(() => fn(...args), ms); };
+}
+</script>
+</body>
+</html>
