@@ -18,29 +18,29 @@ Filename convention for saved vectors:
 Where <concept_slug> is the lowercase, stripped concept name with spaces replaced by underscores.
 """
 
+import hashlib
+import json
 import os
 import re
-import json
-import time
-import hashlib
-import tempfile
 import shutil
+import tempfile
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import threading
 
-import torch
 import nnsight
+import torch
 from dotenv import load_dotenv
 
 # ============================================================================
 # Global Configuration
 # ============================================================================
 
-MODEL = os.environ.get("MODEL", "meta-llama/Llama-3.3-70B-Instruct")
-OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "data/vectors/llama-3.3-70b-instruct"))
+MODEL = os.environ.get("MODEL", "meta-llama/Llama-3.1-70B-Instruct")
+OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "data/vectors/llama-3.1-70b-instruct"))
 MAX_IN_FLIGHT = int(os.environ.get("MAX_IN_FLIGHT", "4"))
 OVERWRITE = os.environ.get("OVERWRITE", "").lower() in ("1", "true", "yes")
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "2.0"))
@@ -88,6 +88,7 @@ _THREAD_LOCAL = threading.local()
 # Helpers
 # ============================================================================
 
+
 def concept_slug(concept: str) -> str:
     """Deterministic filename-safe slug for a concept."""
     return re.sub(r"[^a-z0-9]+", "_", concept.lower()).strip("_")
@@ -104,7 +105,7 @@ def configure_ndif_api_key() -> str:
         raise RuntimeError(
             "NDIF_API_KEY was not found. Add it to your environment or .env file."
         )
-    nnsight.CONFIG.set_default_api_key(api_key) # type: ignore
+    nnsight.CONFIG.set_default_api_key(api_key)  # type: ignore
     return api_key
 
 
@@ -171,7 +172,9 @@ def extract_activations_from_cache(cache, num_layers: int) -> torch.Tensor:
     )
 
 
-def poll_backend(backend, timeout: float = POLL_TIMEOUT, interval: float = POLL_INTERVAL):
+def poll_backend(
+    backend, timeout: float = POLL_TIMEOUT, interval: float = POLL_INTERVAL
+):
     """Poll a non-blocking backend until the result is ready or timeout."""
     start = time.time()
     while True:
@@ -180,8 +183,7 @@ def poll_backend(backend, timeout: float = POLL_TIMEOUT, interval: float = POLL_
             return result
         if time.time() - start > timeout:
             raise TimeoutError(
-                f"Backend poll timed out after {timeout}s. "
-                f"Status: {backend.job_status}"
+                f"Backend poll timed out after {timeout}s. Status: {backend.job_status}"
             )
         time.sleep(interval)
 
@@ -189,6 +191,7 @@ def poll_backend(backend, timeout: float = POLL_TIMEOUT, interval: float = POLL_
 # ============================================================================
 # Phase A: Baseline (parallel, thread-local models)
 # ============================================================================
+
 
 def compute_baseline_vectors(
     model,
@@ -234,10 +237,12 @@ def compute_baseline_vectors(
             if n_done % 10 == 0 or n_done == len(words):
                 elapsed = time.time() - t0
                 rate = n_done / elapsed
-                print(f"  [{n_done}/{len(words)}] {rate:.1f} words/s, elapsed {elapsed:.1f}s")
+                print(
+                    f"  [{n_done}/{len(words)}] {rate:.1f} words/s, elapsed {elapsed:.1f}s"
+                )
 
     baseline_stack = torch.stack(baseline_samples, dim=0)  # [N, num_layers, hidden]
-    baseline_mean = baseline_stack.mean(dim=0)              # [num_layers, hidden]
+    baseline_mean = baseline_stack.mean(dim=0)  # [num_layers, hidden]
 
     # Save
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -255,7 +260,9 @@ def compute_baseline_vectors(
     atomic_save(metadata, OUTPUT_DIR / "baseline_metadata.json")
 
     elapsed = time.time() - t0
-    print(f"[Phase A] Baseline computed in {elapsed:.1f}s. Shape: {baseline_mean.shape}")
+    print(
+        f"[Phase A] Baseline computed in {elapsed:.1f}s. Shape: {baseline_mean.shape}"
+    )
     print(f"          Saved to {OUTPUT_DIR / 'baseline_mean.pt'}")
     return baseline_mean
 
@@ -271,15 +278,13 @@ def load_baseline(path: Optional[Path] = None) -> torch.Tensor:
 # Phase B: Async / parallel concept vector computation
 # ============================================================================
 
+
 def _trace_word_blocking(model, word: str, num_layers: int) -> torch.Tensor:
     """Run a single blocking trace for a word. Returns [num_layers, hidden]."""
     prompt = make_prompt(model, word)
     with model.trace(prompt, remote=True) as tracer:
-        cache = tracer.cache(
-            modules=[layer for layer in model.model.layers]
-        ).save()
+        cache = tracer.cache(modules=[layer for layer in model.model.layers]).save()
     return extract_activations_from_cache(cache, num_layers)
-
 
 
 def compute_concept_vector(
@@ -351,14 +356,18 @@ def compute_all_vectors_async(
         to_compute = [c for c in concepts if not concept_already_on_disk(c)]
         skipped = len(concepts) - len(to_compute)
         if skipped:
-            print(f"[Phase B] Skipping {skipped} concepts already on disk (OVERWRITE=False)")
+            print(
+                f"[Phase B] Skipping {skipped} concepts already on disk (OVERWRITE=False)"
+            )
 
     if not to_compute:
         print("[Phase B] Nothing to compute.")
         return []
 
-    print(f"[Phase B] Computing {len(to_compute)} concept vectors "
-          f"(max_in_flight={max_in_flight})...")
+    print(
+        f"[Phase B] Computing {len(to_compute)} concept vectors "
+        f"(max_in_flight={max_in_flight})..."
+    )
     t0 = time.time()
 
     failures = []
@@ -395,7 +404,9 @@ def compute_all_vectors_async(
                 failures.append(err)
 
     elapsed = time.time() - t0
-    print(f"[Phase B] Completed {completed_count[0]}/{len(to_compute)} in {elapsed:.1f}s")
+    print(
+        f"[Phase B] Completed {completed_count[0]}/{len(to_compute)} in {elapsed:.1f}s"
+    )
     if failures:
         print(f"[Phase B] {len(failures)} failures:")
         for f in failures:
@@ -407,6 +418,7 @@ def compute_all_vectors_async(
 # ============================================================================
 # Verification
 # ============================================================================
+
 
 def verify_against_baseline(
     model,
@@ -456,8 +468,9 @@ def verify_against_baseline(
         if not passed:
             all_pass = False
 
-        print(f"  '{concept}': {status} "
-              f"(max_diff={max_diff:.2e}, cos_sim={cos_sim:.8f})")
+        print(
+            f"  '{concept}': {status} (max_diff={max_diff:.2e}, cos_sim={cos_sim:.8f})"
+        )
 
     if all_pass:
         print("[Verify] All checks passed!")
@@ -470,6 +483,7 @@ def verify_against_baseline(
 # ============================================================================
 # Main
 # ============================================================================
+
 
 def main():
     print("=" * 70)
@@ -497,7 +511,9 @@ def main():
     if baseline_path.exists() and not OVERWRITE:
         print(f"\n[Phase A] Loading existing baseline from {baseline_path}")
         baseline_mean = load_baseline(baseline_path)
-        print(f"          Shape: {baseline_mean.shape}, hash: {tensor_hash(baseline_mean)}")
+        print(
+            f"          Shape: {baseline_mean.shape}, hash: {tensor_hash(baseline_mean)}"
+        )
     else:
         print()
         baseline_mean = compute_baseline_vectors(model)
