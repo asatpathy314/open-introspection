@@ -51,7 +51,7 @@ load_dotenv()
 
 MODEL_ID = "meta-llama/Llama-3.3-70B-Instruct"
 VECTOR_DIR = Path("data/vectors/llama-3.3-70b-instruct")
-RESULTS_DIR = Path("data/results/prefill_detection")
+RESULTS_DIR = Path("data/results/prefill-detection")
 
 # Layer sweep — evenly spaced through model depth
 LAYERS_TO_TEST = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 79]

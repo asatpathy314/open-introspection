@@ -1,7 +1,8 @@
 # Runtime data
 data/vectors/**
 !data/vectors/README.md
-data/results/
+data/results/**
+!data/results/README.md
 data/logs/
 
 # Environment
@@ -9,6 +10,7 @@ data/logs/
 
 # Python
 __pycache__/
+.pycache/
 *.py[cod]
 *$py.class
 *.egg-info/
@@ -29,6 +31,9 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# Linter cache
+.ruff_cache/
 
 # Jupyter
 .ipynb_checkpoints/

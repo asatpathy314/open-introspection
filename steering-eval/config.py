@@ -20,7 +20,7 @@ VECTOR_DIR = Path(
 RESULTS_DIR = Path(
     os.environ.get(
         "RESULTS_DIR",
-        str(PROJECT_ROOT / "data" / "results" / "steering_eval"),
+        str(PROJECT_ROOT / "data" / "results" / "steering-eval"),
     )
 )
 FIGURES_DIR = RESULTS_DIR / "figures"
