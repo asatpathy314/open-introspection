@@ -11,6 +11,7 @@ Usage:
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import sys
@@ -27,10 +28,10 @@ load_dotenv()
 # Configuration
 # ---------------------------------------------------------------------------
 
-INPUT_FILE = Path("data/results/prefill_detection/results.jsonl")
+DEFAULT_INPUT_FILE = Path("data/results/prefill_detection/results.jsonl")
 OUTPUT_DIR = Path("data/results/prefill_detection")
 
-JUDGE_MODEL = "claude-haiku-4-5-20251001"
+DEFAULT_JUDGE_MODEL = "claude-haiku-4-5-20251001"
 # JUDGE_MODEL = "claude-sonnet-4-6"
 
 POLL_INTERVAL_SECONDS = 30
@@ -85,7 +86,7 @@ def load_trials(path: Path) -> list[dict]:
     return trials
 
 
-def build_batch_requests(trials: list[dict]) -> list[dict]:
+def build_batch_requests(trials: list[dict], judge_model: str) -> list[dict]:
     """Build Anthropic batch request objects, one per trial."""
     requests = []
     for idx, trial in enumerate(trials):
@@ -96,7 +97,7 @@ def build_batch_requests(trials: list[dict]) -> list[dict]:
         requests.append({
             "custom_id": str(idx),
             "params": {
-                "model": JUDGE_MODEL,
+                "model": judge_model,
                 "max_tokens": 4,
                 "temperature": 0.0,
                 "messages": [{"role": "user", "content": prompt}],
@@ -121,7 +122,7 @@ def parse_judgment(text: str) -> str:
 
 
 def submit_and_poll(
-    client: anthropic.Anthropic, requests: list[dict]
+    client: anthropic.Anthropic, requests: list[dict], judge_model: str
 ) -> tuple[str, dict[str, str], list[str]]:
     """
     Submit a batch, poll until completion, and return results.
@@ -129,7 +130,7 @@ def submit_and_poll(
     Returns:
         (batch_id, succeeded dict {custom_id: judgment}, failed list [custom_id])
     """
-    log.info(f"Submitting batch of {len(requests)} requests using model {JUDGE_MODEL}")
+    log.info(f"Submitting batch of {len(requests)} requests using model {judge_model}")
     batch = client.messages.batches.create(requests=requests)
     batch_id = batch.id
     log.info(f"Batch created: {batch_id}")
@@ -175,19 +176,46 @@ def main() -> None:
         handlers=[logging.StreamHandler(sys.stdout)],
     )
 
+    parser = argparse.ArgumentParser(description="LLM judge for prefill detection results")
+    parser.add_argument(
+        "--input-file",
+        type=Path,
+        default=DEFAULT_INPUT_FILE,
+        help="Input JSONL file to re-judge",
+    )
+    parser.add_argument(
+        "--output-file",
+        type=Path,
+        default=None,
+        help="Output JSONL file. Defaults to data/results/prefill_detection/results_<judge>.jsonl",
+    )
+    parser.add_argument(
+        "--metadata-file",
+        type=Path,
+        default=None,
+        help="Optional metadata JSON path. Defaults next to the output JSONL.",
+    )
+    parser.add_argument(
+        "--judge-model",
+        type=str,
+        default=DEFAULT_JUDGE_MODEL,
+        help="Anthropic model ID to use for re-judging",
+    )
+    args = parser.parse_args()
+
     client = anthropic.Anthropic()
 
     # Load trials
-    log.info(f"Loading trials from {INPUT_FILE}")
-    trials = load_trials(INPUT_FILE)
+    log.info(f"Loading trials from {args.input_file}")
+    trials = load_trials(args.input_file)
     log.info(f"Loaded {len(trials)} trials")
 
     # Build requests (custom_id = trial index as string)
-    all_requests = build_batch_requests(trials)
+    all_requests = build_batch_requests(trials, args.judge_model)
     batch_ids: list[str] = []
 
     # Initial batch
-    batch_id, succeeded, failed = submit_and_poll(client, all_requests)
+    batch_id, succeeded, failed = submit_and_poll(client, all_requests, args.judge_model)
     batch_ids.append(batch_id)
     judgments: dict[int, str] = {int(k): v for k, v in succeeded.items()}
 
@@ -198,7 +226,7 @@ def main() -> None:
             break
         log.info(f"Retry {retry}/{MAX_RETRIES}: {len(failed)} failed results")
         retry_requests = [requests_by_id[cid] for cid in failed]
-        batch_id, succeeded, failed = submit_and_poll(client, retry_requests)
+        batch_id, succeeded, failed = submit_and_poll(client, retry_requests, args.judge_model)
         batch_ids.append(batch_id)
         for k, v in succeeded.items():
             judgments[int(k)] = v
@@ -210,9 +238,9 @@ def main() -> None:
         judgments[idx] = trials[idx]["judgment"]
 
     # Write re-judged results
-    suffix = model_short_name(JUDGE_MODEL)
-    output_file = OUTPUT_DIR / f"results_{suffix}.jsonl"
-    metadata_file = OUTPUT_DIR / f"results_{suffix}_metadata.json"
+    suffix = model_short_name(args.judge_model)
+    output_file = args.output_file or (OUTPUT_DIR / f"results_{suffix}.jsonl")
+    metadata_file = args.metadata_file or output_file.with_name(f"{output_file.stem}_metadata.json")
 
     with open(output_file, "w") as f:
         for idx, trial in enumerate(trials):
@@ -225,9 +253,9 @@ def main() -> None:
     # Write metadata
     total_failed = len(failed)
     metadata = {
-        "judge_model": JUDGE_MODEL,
+        "judge_model": args.judge_model,
         "batch_ids": batch_ids,
-        "input_file": str(INPUT_FILE),
+        "input_file": str(args.input_file),
         "output_file": str(output_file),
         "judged_at_utc": datetime.now(timezone.utc).isoformat(),
         "total_trials": len(trials),
