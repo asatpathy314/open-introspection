@@ -29,33 +29,118 @@ load_dotenv()
 nnsight.CONFIG.set_default_api_key(os.environ["NDIF_API_KEY"])
 
 BASELINE_WORDS = [
-    "desks", "jackets", "gondolas", "laughter", "intelligence", "bicycles",
-    "chairs", "orchestras", "sand", "pottery", "arrowheads", "jewelry",
-    "daffodils", "plateaus", "estuaries", "quilts", "moments", "bamboo",
-    "ravines", "archives", "hieroglyphs", "stars", "clay", "fossils",
-    "wildlife", "flour", "traffic", "bubbles", "honey", "geodes", "magnets",
-    "ribbons", "zigzags", "puzzles", "tornadoes", "anthills", "galaxies",
-    "poverty", "diamonds", "universes", "vinegar", "nebulae", "knowledge",
-    "marble", "fog", "rivers", "scrolls", "silhouettes", "marbles", "cakes",
-    "valleys", "whispers", "pendulums", "towers", "tables", "glaciers",
-    "whirlpools", "jungles", "wool", "anger", "ramparts", "flowers",
-    "research", "hammers", "clouds", "justice", "dogs", "butterflies",
-    "needles", "fortresses", "bonfires", "skyscrapers", "caravans",
-    "patience", "bacon", "velocities", "smoke", "electricity", "sunsets",
-    "anchors", "parchments", "courage", "statues", "oxygen", "time",
-    "butterflies", "fabric", "pasta", "snowflakes", "mountains", "echoes",
-    "pianos", "sanctuaries", "abysses", "air", "dewdrops", "gardens",
-    "literature", "rice", "enigmas",
+    "desks",
+    "jackets",
+    "gondolas",
+    "laughter",
+    "intelligence",
+    "bicycles",
+    "chairs",
+    "orchestras",
+    "sand",
+    "pottery",
+    "arrowheads",
+    "jewelry",
+    "daffodils",
+    "plateaus",
+    "estuaries",
+    "quilts",
+    "moments",
+    "bamboo",
+    "ravines",
+    "archives",
+    "hieroglyphs",
+    "stars",
+    "clay",
+    "fossils",
+    "wildlife",
+    "flour",
+    "traffic",
+    "bubbles",
+    "honey",
+    "geodes",
+    "magnets",
+    "ribbons",
+    "zigzags",
+    "puzzles",
+    "tornadoes",
+    "anthills",
+    "galaxies",
+    "poverty",
+    "diamonds",
+    "universes",
+    "vinegar",
+    "nebulae",
+    "knowledge",
+    "marble",
+    "fog",
+    "rivers",
+    "scrolls",
+    "silhouettes",
+    "marbles",
+    "cakes",
+    "valleys",
+    "whispers",
+    "pendulums",
+    "towers",
+    "tables",
+    "glaciers",
+    "whirlpools",
+    "jungles",
+    "wool",
+    "anger",
+    "ramparts",
+    "flowers",
+    "research",
+    "hammers",
+    "clouds",
+    "justice",
+    "dogs",
+    "butterflies",
+    "needles",
+    "fortresses",
+    "bonfires",
+    "skyscrapers",
+    "caravans",
+    "patience",
+    "bacon",
+    "velocities",
+    "smoke",
+    "electricity",
+    "sunsets",
+    "anchors",
+    "parchments",
+    "courage",
+    "statues",
+    "oxygen",
+    "time",
+    "butterflies",
+    "fabric",
+    "pasta",
+    "snowflakes",
+    "mountains",
+    "echoes",
+    "pianos",
+    "sanctuaries",
+    "abysses",
+    "air",
+    "dewdrops",
+    "gardens",
+    "literature",
+    "rice",
+    "enigmas",
 ]
 
 
 def tensor_hash(t: torch.Tensor) -> str:
     cpu_t = t.detach().cpu().contiguous()
-    payload = b"|".join([
-        str(cpu_t.dtype).encode(),
-        str(tuple(cpu_t.shape)).encode(),
-        cpu_t.view(torch.uint8).numpy().tobytes(),
-    ])
+    payload = b"|".join(
+        [
+            str(cpu_t.dtype).encode(),
+            str(tuple(cpu_t.shape)).encode(),
+            cpu_t.view(torch.uint8).numpy().tobytes(),
+        ]
+    )
     return hashlib.sha256(payload).hexdigest()[:16]
 
 
@@ -87,7 +172,9 @@ def extract_word(model, word: str) -> torch.Tensor:
     """
     messages = [{"role": "user", "content": f"Tell me about {word}."}]
     prompt = model.tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True,
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
     )
 
     # Chunk 1: layers 0-19
@@ -182,16 +269,91 @@ def extract_word(model, word: str) -> torch.Tensor:
         h78 = model.model.layers[78].output[0][-1, :].save()
         h79 = model.model.layers[79].output[0][-1, :].save()
 
-    return torch.stack([
-        h00, h01, h02, h03, h04, h05, h06, h07, h08, h09,
-        h10, h11, h12, h13, h14, h15, h16, h17, h18, h19,
-        h20, h21, h22, h23, h24, h25, h26, h27, h28, h29,
-        h30, h31, h32, h33, h34, h35, h36, h37, h38, h39,
-        h40, h41, h42, h43, h44, h45, h46, h47, h48, h49,
-        h50, h51, h52, h53, h54, h55, h56, h57, h58, h59,
-        h60, h61, h62, h63, h64, h65, h66, h67, h68, h69,
-        h70, h71, h72, h73, h74, h75, h76, h77, h78, h79,
-    ], dim=0)
+    return torch.stack(
+        [
+            h00,
+            h01,
+            h02,
+            h03,
+            h04,
+            h05,
+            h06,
+            h07,
+            h08,
+            h09,
+            h10,
+            h11,
+            h12,
+            h13,
+            h14,
+            h15,
+            h16,
+            h17,
+            h18,
+            h19,
+            h20,
+            h21,
+            h22,
+            h23,
+            h24,
+            h25,
+            h26,
+            h27,
+            h28,
+            h29,
+            h30,
+            h31,
+            h32,
+            h33,
+            h34,
+            h35,
+            h36,
+            h37,
+            h38,
+            h39,
+            h40,
+            h41,
+            h42,
+            h43,
+            h44,
+            h45,
+            h46,
+            h47,
+            h48,
+            h49,
+            h50,
+            h51,
+            h52,
+            h53,
+            h54,
+            h55,
+            h56,
+            h57,
+            h58,
+            h59,
+            h60,
+            h61,
+            h62,
+            h63,
+            h64,
+            h65,
+            h66,
+            h67,
+            h68,
+            h69,
+            h70,
+            h71,
+            h72,
+            h73,
+            h74,
+            h75,
+            h76,
+            h77,
+            h78,
+            h79,
+        ],
+        dim=0,
+    )
 
 
 def main():
@@ -221,14 +383,14 @@ def main():
                 continue
             if (i + 1) % 10 == 0:
                 elapsed = time.time() - t0
-                print(f"  [{i+1}/{len(BASELINE_WORDS)}] {elapsed:.1f}s")
+                print(f"  [{i + 1}/{len(BASELINE_WORDS)}] {elapsed:.1f}s")
 
         baseline_mean = torch.stack(samples).mean(dim=0)
         atomic_save(baseline_mean, baseline_path)
         meta = {
             "model": MODEL_ID,
             "num_words": len(samples),
-            "words": BASELINE_WORDS[:len(samples)],
+            "words": BASELINE_WORDS[: len(samples)],
             "num_layers": NUM_LAYERS,
             "hidden_dim": baseline_mean.shape[1],
             "shape": list(baseline_mean.shape),
@@ -249,7 +411,7 @@ def main():
         meta_path = VECTOR_DIR / f"{slug}_metadata.json"
 
         if vec_path.exists() and meta_path.exists() and not overwrite:
-            print(f"  [{i+1}/{len(CONCEPT_WORDS)}] {concept}: exists, skipping")
+            print(f"  [{i + 1}/{len(CONCEPT_WORDS)}] {concept}: exists, skipping")
             continue
 
         try:
@@ -268,9 +430,9 @@ def main():
             }
             atomic_save(meta, meta_path)
             elapsed = time.time() - t0
-            print(f"  [{i+1}/{len(CONCEPT_WORDS)}] {concept}: done ({elapsed:.1f}s)")
+            print(f"  [{i + 1}/{len(CONCEPT_WORDS)}] {concept}: done ({elapsed:.1f}s)")
         except Exception as e:
-            print(f"  [{i+1}/{len(CONCEPT_WORDS)}] {concept}: FAILED ({e})")
+            print(f"  [{i + 1}/{len(CONCEPT_WORDS)}] {concept}: FAILED ({e})")
 
     print("\nDone.")
 

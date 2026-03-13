@@ -4,17 +4,25 @@ import numpy as np
 from scipy import stats
 
 
-def bootstrap_ci(data: list[float], n_boot: int = 1000, ci: float = 0.95) -> tuple[float, float, float]:
+def bootstrap_ci(
+    data: list[float], n_boot: int = 1000, ci: float = 0.95
+) -> tuple[float, float, float]:
     """Bootstrap mean and confidence interval. Returns (mean, ci_low, ci_high)."""
     data = np.array(data)
     if len(data) == 0:
         return 0.0, 0.0, 0.0
-    boot_means = np.array([
-        np.mean(np.random.choice(data, size=len(data), replace=True))
-        for _ in range(n_boot)
-    ])
+    boot_means = np.array(
+        [
+            np.mean(np.random.choice(data, size=len(data), replace=True))
+            for _ in range(n_boot)
+        ]
+    )
     alpha = (1 - ci) / 2
-    return float(np.mean(data)), float(np.percentile(boot_means, 100 * alpha)), float(np.percentile(boot_means, 100 * (1 - alpha)))
+    return (
+        float(np.mean(data)),
+        float(np.percentile(boot_means, 100 * alpha)),
+        float(np.percentile(boot_means, 100 * (1 - alpha))),
+    )
 
 
 def steerability_significance(steerabilities: list[float]) -> tuple[float, float]:
@@ -54,7 +62,9 @@ def binomial_test(successes: int, trials: int, chance: float = 0.1) -> float:
     """One-sided binomial test: P(X >= successes) under H0: p = chance."""
     if trials == 0:
         return 1.0
-    return float(stats.binomtest(successes, trials, chance, alternative="greater").pvalue)
+    return float(
+        stats.binomtest(successes, trials, chance, alternative="greater").pvalue
+    )
 
 
 def spearman_monotonicity(xs: list[float], ys: list[float]) -> tuple[float, float]:

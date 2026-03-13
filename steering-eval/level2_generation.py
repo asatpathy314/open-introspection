@@ -23,14 +23,23 @@ sys.path.insert(0, str(Path(__file__).parent))
 import torch
 
 from config import (
-    ALPHA_SWEEP, CONCEPT_WORDS, GENERATION_MAX_TOKENS,
-    GENERATION_TEMPERATURE, GENERATION_TOP_P, MAX_RETRIES, RESULTS_DIR,
-    RETRY_DELAY, SEED, VECTOR_DIR,
+    ALPHA_SWEEP,
+    CONCEPT_WORDS,
+    GENERATION_MAX_TOKENS,
+    GENERATION_TEMPERATURE,
+    GENERATION_TOP_P,
+    MAX_RETRIES,
+    RESULTS_DIR,
+    RETRY_DELAY,
+    SEED,
+    VECTOR_DIR,
 )
 from ndif_utils import setup_ndif
 from vectors import get_baseline_norms, load_all_concept_vectors, normalize_vector
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+)
 log = logging.getLogger(__name__)
 
 DEFAULT_NEUTRAL_PROMPT = (
@@ -60,6 +69,7 @@ If the text is garbled, repetitive, or nonsensical, answer NO.
 
 def call_llm_judge(prompt: str) -> str:
     import anthropic
+
     client = anthropic.Anthropic()
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
@@ -81,14 +91,22 @@ def normalize_prompt_label(prompt_label: str) -> str:
     return normalized or "prompt"
 
 
-def generate_steered(model, prompt: str, layer_idx: int, steering_vec, alpha: float, max_new_tokens: int) -> str:
+def generate_steered(
+    model, prompt: str, layer_idx: int, steering_vec, alpha: float, max_new_tokens: int
+) -> str:
     """Generate with steering. MUST be in __main__ file for nnsight."""
     input_ids = model.tokenizer(prompt, return_tensors="pt")["input_ids"]
     prompt_len = input_ids.shape[1]
 
     if steering_vec is not None and alpha != 0:
-        with model.generate(prompt, max_new_tokens=max_new_tokens, do_sample=True,
-                            temperature=GENERATION_TEMPERATURE, top_p=GENERATION_TOP_P, remote=True):
+        with model.generate(
+            prompt,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=GENERATION_TEMPERATURE,
+            top_p=GENERATION_TOP_P,
+            remote=True,
+        ):
             hs = model.model.layers[layer_idx].output[0]
             sv = (alpha * steering_vec).to(device=hs.device, dtype=hs.dtype)
             scope = generate_steered.injection_scope
@@ -110,8 +128,14 @@ def generate_steered(model, prompt: str, layer_idx: int, steering_vec, alpha: fl
                 raise ValueError(f"Unknown injection scope: {scope}")
             out_ids = model.generator.output.save()
     else:
-        with model.generate(prompt, max_new_tokens=max_new_tokens, do_sample=True,
-                            temperature=GENERATION_TEMPERATURE, top_p=GENERATION_TOP_P, remote=True):
+        with model.generate(
+            prompt,
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=GENERATION_TEMPERATURE,
+            top_p=GENERATION_TOP_P,
+            remote=True,
+        ):
             out_ids = model.generator.output.save()
 
     generated_ids = out_ids[0][prompt_len:]
@@ -120,7 +144,9 @@ def generate_steered(model, prompt: str, layer_idx: int, steering_vec, alpha: fl
 
 def main():
     parser = argparse.ArgumentParser(description="Level 2: Open-Ended Generation Eval")
-    parser.add_argument("--norm", default="raw", choices=["raw", "unit", "norm_matched"])
+    parser.add_argument(
+        "--norm", default="raw", choices=["raw", "unit", "norm_matched"]
+    )
     parser.add_argument("--layers", type=int, nargs="+", default=[40])
     parser.add_argument("--concepts", type=str, nargs="+", default=None)
     parser.add_argument("--num-generations", type=int, default=20)
@@ -137,7 +163,9 @@ def main():
 
     norm = args.norm
     layers = args.layers
-    concepts = [c.lower() for c in args.concepts] if args.concepts else CONCEPT_WORDS[:20]
+    concepts = (
+        [c.lower() for c in args.concepts] if args.concepts else CONCEPT_WORDS[:20]
+    )
     alphas = args.alphas or ALPHA_SWEEP[norm]
     num_gens = args.num_generations
     prompt_text = args.prompt_text
@@ -168,20 +196,27 @@ def main():
             for line in f:
                 if line.strip():
                     r = json.loads(line)
-                    done_keys.add((
-                        r["concept"],
-                        r["layer"],
-                        r["alpha"],
-                        r["gen_idx"],
-                        r.get("prompt_label", "today"),
-                        r.get("injection_scope", "assistant_only"),
-                    ))
+                    done_keys.add(
+                        (
+                            r["concept"],
+                            r["layer"],
+                            r["alpha"],
+                            r["gen_idx"],
+                            r.get("prompt_label", "today"),
+                            r.get("injection_scope", "assistant_only"),
+                        )
+                    )
         log.info("Resuming: %d generations already done", len(done_keys))
 
     total = len(concepts) * len(layers) * len(alphas) * num_gens
     log.info(
         "Generation eval: %d concepts x %d layers x %d alphas x %d gens = %d (prompt=%s)",
-        len(concepts), len(layers), len(alphas), num_gens, total, prompt_label,
+        len(concepts),
+        len(layers),
+        len(alphas),
+        num_gens,
+        total,
+        prompt_label,
     )
 
     with open(output_path, "a") as out_f:
@@ -194,7 +229,14 @@ def main():
 
                 for alpha in alphas:
                     for gen_idx in range(num_gens):
-                        key = (concept, layer, alpha, gen_idx, prompt_label, injection_scope)
+                        key = (
+                            concept,
+                            layer,
+                            alpha,
+                            gen_idx,
+                            prompt_label,
+                            injection_scope,
+                        )
                         if key in done_keys:
                             continue
 
@@ -203,12 +245,21 @@ def main():
                         for attempt in range(1, MAX_RETRIES + 1):
                             try:
                                 response = generate_steered(
-                                    model, prompt_text, layer, steering_vec, alpha,
+                                    model,
+                                    prompt_text,
+                                    layer,
+                                    steering_vec,
+                                    alpha,
                                     max_new_tokens=GENERATION_MAX_TOKENS,
                                 )
                                 break
                             except Exception as e:
-                                log.warning("Gen attempt %d/%d failed: %s", attempt, MAX_RETRIES, e)
+                                log.warning(
+                                    "Gen attempt %d/%d failed: %s",
+                                    attempt,
+                                    MAX_RETRIES,
+                                    e,
+                                )
                                 if attempt < MAX_RETRIES:
                                     time.sleep(RETRY_DELAY * attempt)
 
@@ -225,16 +276,22 @@ def main():
                             rng.shuffle(word_list)
                             judge_prompt = JUDGE_ID_PROMPT.format(
                                 response=response,
-                                word_list="\n".join(f"- {w.capitalize()}" for w in word_list),
+                                word_list="\n".join(
+                                    f"- {w.capitalize()}" for w in word_list
+                                ),
                             )
-                            id_answer = call_llm_judge(judge_prompt).lower().strip().rstrip(".")
+                            id_answer = (
+                                call_llm_judge(judge_prompt).lower().strip().rstrip(".")
+                            )
                             id_correct = id_answer == concept.lower()
                         except Exception as e:
                             log.warning("Judge ID failed: %s", e)
                             id_correct, id_answer = False, "ERROR"
 
                         try:
-                            coh_prompt = JUDGE_COHERENCE_PROMPT.format(response=response)
+                            coh_prompt = JUDGE_COHERENCE_PROMPT.format(
+                                response=response
+                            )
                             coh_answer = call_llm_judge(coh_prompt).upper().strip()
                             coherent = coh_answer.startswith("YES")
                         except Exception as e:

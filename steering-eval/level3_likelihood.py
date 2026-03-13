@@ -23,13 +23,20 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).parent))
 
 from config import (
-    ALPHA_SWEEP, CONCEPT_WORDS, MAX_RETRIES,
-    RESULTS_DIR, RETRY_DELAY, SEED, VECTOR_DIR,
+    ALPHA_SWEEP,
+    CONCEPT_WORDS,
+    MAX_RETRIES,
+    RESULTS_DIR,
+    RETRY_DELAY,
+    SEED,
+    VECTOR_DIR,
 )
 from ndif_utils import setup_ndif
 from vectors import get_baseline_norms, load_all_concept_vectors, normalize_vector
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+)
 log = logging.getLogger(__name__)
 
 PROMPT_TEXT = "What are you thinking about right now?"
@@ -51,7 +58,9 @@ NEGATIVE_TEMPLATES = [
 ]
 
 
-def trace_steered_logits(model, full_text: str, layer_idx: int, steering_vec, alpha: float) -> torch.Tensor:
+def trace_steered_logits(
+    model, full_text: str, layer_idx: int, steering_vec, alpha: float
+) -> torch.Tensor:
     """Forward pass with steering. Returns logits [seq_len, vocab]. MUST be in __main__."""
     if steering_vec is not None and alpha != 0:
         with model.trace(full_text, remote=True):
@@ -66,9 +75,11 @@ def trace_steered_logits(model, full_text: str, layer_idx: int, steering_vec, al
     return logits.detach().cpu().float()
 
 
-def compute_continuation_ll(logits: torch.Tensor, input_ids: torch.Tensor, prompt_len: int) -> float:
+def compute_continuation_ll(
+    logits: torch.Tensor, input_ids: torch.Tensor, prompt_len: int
+) -> float:
     """Mean log-likelihood of continuation tokens."""
-    cont_logits = logits[prompt_len - 1:-1]
+    cont_logits = logits[prompt_len - 1 : -1]
     cont_targets = input_ids[prompt_len:]
     if cont_logits.shape[0] == 0:
         return 0.0
@@ -85,8 +96,16 @@ def compute_likelihood_deltas(results: list[dict]) -> dict[str, dict]:
 
     out = {}
     for concept, rows in by_concept.items():
-        bl_pos = [r["mean_ll"] for r in rows if r["alpha"] == 0 and r["cont_type"] == "positive"]
-        bl_neg = [r["mean_ll"] for r in rows if r["alpha"] == 0 and r["cont_type"] == "negative"]
+        bl_pos = [
+            r["mean_ll"]
+            for r in rows
+            if r["alpha"] == 0 and r["cont_type"] == "positive"
+        ]
+        bl_neg = [
+            r["mean_ll"]
+            for r in rows
+            if r["alpha"] == 0 and r["cont_type"] == "negative"
+        ]
         if not bl_pos or not bl_neg:
             continue
 
@@ -121,7 +140,9 @@ def compute_likelihood_deltas(results: list[dict]) -> dict[str, dict]:
 
 def main():
     parser = argparse.ArgumentParser(description="Level 3: Likelihood Evaluation")
-    parser.add_argument("--norm", default="raw", choices=["raw", "unit", "norm_matched"])
+    parser.add_argument(
+        "--norm", default="raw", choices=["raw", "unit", "norm_matched"]
+    )
     parser.add_argument("--layers", type=int, nargs="+", default=[40])
     parser.add_argument("--concepts", type=str, nargs="+", default=None)
     parser.add_argument("--num-continuations", type=int, default=10)
@@ -149,14 +170,29 @@ def main():
             for line in f:
                 if line.strip():
                     r = json.loads(line)
-                    done_keys.add((r["concept"], r["layer"], r["alpha"], r["cont_type"], r["cont_idx"]))
+                    done_keys.add(
+                        (
+                            r["concept"],
+                            r["layer"],
+                            r["alpha"],
+                            r["cont_type"],
+                            r["cont_idx"],
+                        )
+                    )
 
-    log.info("Likelihood eval: %d concepts, %d layers, %d alphas, %d continuations",
-             len(concepts), len(layers), len(alphas), num_cont)
+    log.info(
+        "Likelihood eval: %d concepts, %d layers, %d alphas, %d continuations",
+        len(concepts),
+        len(layers),
+        len(alphas),
+        num_cont,
+    )
 
     # Build prompt prefix
     messages = [{"role": "user", "content": PROMPT_TEXT}]
-    prompt_prefix = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    prompt_prefix = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
 
     with open(output_path, "a") as out_f:
         for concept in concepts:
@@ -178,25 +214,40 @@ def main():
                 steering_vec = normalize_vector(raw_vec, norm, bl_norm)
 
                 for alpha in alphas:
-                    for cont_type, continuations in [("positive", positives), ("negative", negatives)]:
+                    for cont_type, continuations in [
+                        ("positive", positives),
+                        ("negative", negatives),
+                    ]:
                         for cont_idx, continuation in enumerate(continuations):
                             key = (concept, layer, alpha, cont_type, cont_idx)
                             if key in done_keys:
                                 continue
 
                             full_text = prompt_prefix + continuation
-                            input_ids = tokenizer.encode(full_text, return_tensors="pt")[0]
-                            prompt_len = len(tokenizer.encode(prompt_prefix, add_special_tokens=False))
+                            input_ids = tokenizer.encode(
+                                full_text, return_tensors="pt"
+                            )[0]
+                            prompt_len = len(
+                                tokenizer.encode(
+                                    prompt_prefix, add_special_tokens=False
+                                )
+                            )
 
                             logits = None
                             for attempt in range(1, MAX_RETRIES + 1):
                                 try:
                                     logits = trace_steered_logits(
-                                        model, full_text, layer, steering_vec, alpha,
+                                        model,
+                                        full_text,
+                                        layer,
+                                        steering_vec,
+                                        alpha,
                                     )
                                     break
                                 except Exception as e:
-                                    log.warning("Attempt %d/%d: %s", attempt, MAX_RETRIES, e)
+                                    log.warning(
+                                        "Attempt %d/%d: %s", attempt, MAX_RETRIES, e
+                                    )
                                     if attempt < MAX_RETRIES:
                                         time.sleep(RETRY_DELAY * attempt)
 

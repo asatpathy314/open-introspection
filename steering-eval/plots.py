@@ -26,6 +26,7 @@ def load_jsonl(path: Path) -> list[dict]:
 
 # ── Figure 1: Propensity curves per concept ──
 
+
 def plot_propensity_curves(results: list[dict], out_path: Path | None = None):
     """Plot m_LD vs alpha for each concept, with error bars."""
     _ensure_dir()
@@ -42,7 +43,9 @@ def plot_propensity_curves(results: list[dict], out_path: Path | None = None):
         ax = axes[idx // cols][idx % cols]
         alphas = sorted(alpha_dict.keys())
         means = [np.mean(alpha_dict[a]) for a in alphas]
-        sems = [np.std(alpha_dict[a]) / max(np.sqrt(len(alpha_dict[a])), 1) for a in alphas]
+        sems = [
+            np.std(alpha_dict[a]) / max(np.sqrt(len(alpha_dict[a])), 1) for a in alphas
+        ]
         ax.errorbar(alphas, means, yerr=sems, marker="o", capsize=3)
         ax.axhline(0, color="gray", linestyle="--", alpha=0.5)
         ax.set_title(concept, fontsize=9)
@@ -62,6 +65,7 @@ def plot_propensity_curves(results: list[dict], out_path: Path | None = None):
 
 
 # ── Figure 2: Layer sweep heatmap ──
+
 
 def plot_layer_heatmap(steerability_data: dict, out_path: Path | None = None):
     """
@@ -95,9 +99,16 @@ def plot_layer_heatmap(steerability_data: dict, out_path: Path | None = None):
     else:
         raise ValueError("Pass raw results list for layer heatmap")
 
-    fig, ax = plt.subplots(figsize=(max(12, len(layers) * 0.8), max(8, len(concepts) * 0.3)))
-    im = ax.imshow(matrix, aspect="auto", cmap="RdBu_r",
-                   vmin=-np.abs(matrix).max(), vmax=np.abs(matrix).max())
+    fig, ax = plt.subplots(
+        figsize=(max(12, len(layers) * 0.8), max(8, len(concepts) * 0.3))
+    )
+    im = ax.imshow(
+        matrix,
+        aspect="auto",
+        cmap="RdBu_r",
+        vmin=-np.abs(matrix).max(),
+        vmax=np.abs(matrix).max(),
+    )
     ax.set_xticks(range(len(layers)))
     ax.set_xticklabels(layers, fontsize=7)
     ax.set_yticks(range(len(concepts)))
@@ -115,7 +126,10 @@ def plot_layer_heatmap(steerability_data: dict, out_path: Path | None = None):
 
 # ── Figure 3: Steerability distribution ──
 
-def plot_steerability_distribution(steerability_by_concept: dict, out_path: Path | None = None):
+
+def plot_steerability_distribution(
+    steerability_by_concept: dict, out_path: Path | None = None
+):
     _ensure_dir()
     concepts = sorted(steerability_by_concept.keys())
     scores = [steerability_by_concept[c]["steerability"] for c in concepts]
@@ -135,7 +149,10 @@ def plot_steerability_distribution(steerability_by_concept: dict, out_path: Path
 
 # ── Figure 4: Per-sample steerability violin plots ──
 
-def plot_per_sample_violins(steerability_by_concept: dict, top_n: int = 10, out_path: Path | None = None):
+
+def plot_per_sample_violins(
+    steerability_by_concept: dict, top_n: int = 10, out_path: Path | None = None
+):
     _ensure_dir()
     sorted_concepts = sorted(
         steerability_by_concept.keys(),
@@ -171,6 +188,7 @@ def plot_per_sample_violins(steerability_by_concept: dict, top_n: int = 10, out_
 
 # ── Figure 5: Anti-steerability fraction bar chart ──
 
+
 def plot_anti_steerability(steerability_by_concept: dict, out_path: Path | None = None):
     _ensure_dir()
     concepts = sorted(steerability_by_concept.keys())
@@ -192,6 +210,7 @@ def plot_anti_steerability(steerability_by_concept: dict, out_path: Path | None 
 
 # ── Figure 6: Coherence vs identification accuracy ──
 
+
 def plot_coherence_vs_accuracy(gen_results: list[dict], out_path: Path | None = None):
     _ensure_dir()
     by_config = defaultdict(lambda: {"id_correct": [], "coherent": []})
@@ -210,7 +229,9 @@ def plot_coherence_vs_accuracy(gen_results: list[dict], out_path: Path | None = 
     ax.scatter(accs, cohs, alpha=0.5)
     ax.set_xlabel("Identification Accuracy")
     ax.set_ylabel("Coherence Rate")
-    ax.axhline(0.9, color="red", linestyle="--", alpha=0.5, label="90% coherence threshold")
+    ax.axhline(
+        0.9, color="red", linestyle="--", alpha=0.5, label="90% coherence threshold"
+    )
     ax.axvline(0.1, color="blue", linestyle="--", alpha=0.5, label="Chance (10%)")
     ax.legend()
     ax.set_title("Coherence vs Identification Accuracy")

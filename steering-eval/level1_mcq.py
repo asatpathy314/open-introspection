@@ -27,13 +27,21 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent))
 
 from config import (
-    ALPHA_SWEEP, CONCEPT_WORDS, LAYERS_TO_TEST,
-    MAX_RETRIES, RESULTS_DIR, RETRY_DELAY, SEED, VECTOR_DIR,
+    ALPHA_SWEEP,
+    CONCEPT_WORDS,
+    LAYERS_TO_TEST,
+    MAX_RETRIES,
+    RESULTS_DIR,
+    RETRY_DELAY,
+    SEED,
+    VECTOR_DIR,
 )
 from ndif_utils import setup_ndif
 from vectors import get_baseline_norms, load_all_concept_vectors, normalize_vector
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+)
 log = logging.getLogger(__name__)
 
 # ── Prompt template ──
@@ -47,17 +55,25 @@ MCQ_TEMPLATE = (
 )
 
 
-def build_mcq_prompt(concept: str, distractor: str, concept_is_a: bool) -> tuple[str, str, str]:
+def build_mcq_prompt(
+    concept: str, distractor: str, concept_is_a: bool
+) -> tuple[str, str, str]:
     """Returns (prompt_text, correct_token, incorrect_token)."""
     if concept_is_a:
-        prompt = MCQ_TEMPLATE.format(option_a=concept.capitalize(), option_b=distractor.capitalize())
+        prompt = MCQ_TEMPLATE.format(
+            option_a=concept.capitalize(), option_b=distractor.capitalize()
+        )
         return prompt, "A", "B"
     else:
-        prompt = MCQ_TEMPLATE.format(option_a=distractor.capitalize(), option_b=concept.capitalize())
+        prompt = MCQ_TEMPLATE.format(
+            option_a=distractor.capitalize(), option_b=concept.capitalize()
+        )
         return prompt, "B", "A"
 
 
-def run_mcq_trial(model, prompt: str, layer_idx: int, steering_vec, alpha: float) -> torch.Tensor:
+def run_mcq_trial(
+    model, prompt: str, layer_idx: int, steering_vec, alpha: float
+) -> torch.Tensor:
     """
     Single MCQ trial: inject steering_vec at layer_idx with strength alpha,
     return logits at last token position.
@@ -77,12 +93,16 @@ def run_mcq_trial(model, prompt: str, layer_idx: int, steering_vec, alpha: float
     return logits.detach().cpu().float()
 
 
-def compute_propensity(logits: torch.Tensor, tokenizer, correct_token: str, incorrect_token: str) -> float:
+def compute_propensity(
+    logits: torch.Tensor, tokenizer, correct_token: str, incorrect_token: str
+) -> float:
     """m_LD = logit(correct) - logit(incorrect)."""
     a_id = tokenizer.encode("A", add_special_tokens=False)[0]
     b_id = tokenizer.encode("B", add_special_tokens=False)[0]
     token_map = {"A": a_id, "B": b_id}
-    return (logits[token_map[correct_token]] - logits[token_map[incorrect_token]]).item()
+    return (
+        logits[token_map[correct_token]] - logits[token_map[incorrect_token]]
+    ).item()
 
 
 def compute_steerability(results: list[dict]) -> dict[str, dict]:
@@ -94,7 +114,9 @@ def compute_steerability(results: list[dict]) -> dict[str, dict]:
     out = {}
     for concept, rows in by_concept.items():
         # Per-sample grouping
-        by_sample: dict[tuple, dict[float, list[float]]] = defaultdict(lambda: defaultdict(list))
+        by_sample: dict[tuple, dict[float, list[float]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
         for r in rows:
             sample_key = (r["distractor"], r.get("concept_is_a", True))
             by_sample[sample_key][r["alpha"]].append(r["propensity"])
@@ -122,7 +144,11 @@ def compute_steerability(results: list[dict]) -> dict[str, dict]:
             sys_ = np.array([np.mean(alpha_dict[a]) for a in sa])
             per_sample_slopes.append(float(np.polyfit(sxs, sys_, 1)[0]))
 
-        anti_frac = float(np.mean([s < 0 for s in per_sample_slopes])) if per_sample_slopes else 0.0
+        anti_frac = (
+            float(np.mean([s < 0 for s in per_sample_slopes]))
+            if per_sample_slopes
+            else 0.0
+        )
 
         out[concept] = {
             "steerability": steerability,
@@ -135,7 +161,9 @@ def compute_steerability(results: list[dict]) -> dict[str, dict]:
 
 def main():
     parser = argparse.ArgumentParser(description="Level 1: MCQ Propensity Sweep")
-    parser.add_argument("--norm", default="raw", choices=["raw", "unit", "norm_matched"])
+    parser.add_argument(
+        "--norm", default="raw", choices=["raw", "unit", "norm_matched"]
+    )
     parser.add_argument("--layers", type=int, nargs="+", default=None)
     parser.add_argument("--concepts", type=str, nargs="+", default=None)
     parser.add_argument("--num-distractors", type=int, default=5)
@@ -171,19 +199,29 @@ def main():
             for line in f:
                 if line.strip():
                     r = json.loads(line)
-                    done_keys.add((r["concept"], r["distractor"], r["layer"], r["alpha"]))
+                    done_keys.add(
+                        (r["concept"], r["distractor"], r["layer"], r["alpha"])
+                    )
         log.info("Resuming: %d trials already done", len(done_keys))
 
     total = len(trials) * len(layers) * len(alphas)
-    log.info("MCQ sweep: %d trials x %d layers x %d alphas = %d total (norm=%s)",
-             len(trials), len(layers), len(alphas), total, norm)
+    log.info(
+        "MCQ sweep: %d trials x %d layers x %d alphas = %d total (norm=%s)",
+        len(trials),
+        len(layers),
+        len(alphas),
+        total,
+        norm,
+    )
 
     results = []
     completed = 0
 
     with open(output_path, "a") as out_f:
         for concept, distractor, concept_is_a in trials:
-            prompt, correct_tok, incorrect_tok = build_mcq_prompt(concept, distractor, concept_is_a)
+            prompt, correct_tok, incorrect_tok = build_mcq_prompt(
+                concept, distractor, concept_is_a
+            )
             concept_vec_all = all_vecs[concept]
 
             for layer in layers:
@@ -201,10 +239,14 @@ def main():
                     logits = None
                     for attempt in range(1, MAX_RETRIES + 1):
                         try:
-                            logits = run_mcq_trial(model, prompt, layer, steering_vec, alpha)
+                            logits = run_mcq_trial(
+                                model, prompt, layer, steering_vec, alpha
+                            )
                             break
                         except Exception as e:
-                            log.warning("Attempt %d/%d failed: %s", attempt, MAX_RETRIES, e)
+                            log.warning(
+                                "Attempt %d/%d failed: %s", attempt, MAX_RETRIES, e
+                            )
                             if attempt == MAX_RETRIES:
                                 log.error("All retries exhausted for %s", key)
                             else:
@@ -213,7 +255,9 @@ def main():
                     if logits is None:
                         continue
 
-                    m_ld = compute_propensity(logits, tokenizer, correct_tok, incorrect_tok)
+                    m_ld = compute_propensity(
+                        logits, tokenizer, correct_tok, incorrect_tok
+                    )
 
                     row = {
                         "concept": concept,
@@ -232,8 +276,15 @@ def main():
                     completed += 1
 
                     if completed % 50 == 0:
-                        log.info("  [%d/%d] %s layer=%d alpha=%.1f m_LD=%.3f",
-                                 completed, total, concept, layer, alpha, m_ld)
+                        log.info(
+                            "  [%d/%d] %s layer=%d alpha=%.1f m_LD=%.3f",
+                            completed,
+                            total,
+                            concept,
+                            layer,
+                            alpha,
+                            m_ld,
+                        )
 
     log.info("MCQ sweep complete. %d results -> %s", len(results), output_path)
 

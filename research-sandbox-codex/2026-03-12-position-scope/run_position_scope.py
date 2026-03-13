@@ -41,7 +41,9 @@ from config import (  # noqa: E402
 from ndif_utils import setup_ndif  # noqa: E402
 from vectors import get_baseline_norms, load_all_concept_vectors, normalize_vector  # noqa: E402
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+)
 log = logging.getLogger(__name__)
 
 DEFAULT_PROMPT = (
@@ -118,7 +120,9 @@ def build_injection(hidden_states, steering_delta, prompt_len: int, scope: str):
     return injection
 
 
-def generate_with_scope(model, prompt: str, layer_idx: int, steering_vec, alpha: float, scope: str) -> str:
+def generate_with_scope(
+    model, prompt: str, layer_idx: int, steering_vec, alpha: float, scope: str
+) -> str:
     input_ids = model.tokenizer(prompt, return_tensors="pt")["input_ids"]
     prompt_len = input_ids.shape[1]
 
@@ -152,8 +156,12 @@ def generate_with_scope(model, prompt: str, layer_idx: int, steering_vec, alpha:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Open-ended scope-localization experiment")
-    parser.add_argument("--norm", default="raw", choices=["raw", "unit", "norm_matched"])
+    parser = argparse.ArgumentParser(
+        description="Open-ended scope-localization experiment"
+    )
+    parser.add_argument(
+        "--norm", default="raw", choices=["raw", "unit", "norm_matched"]
+    )
     parser.add_argument("--layer", type=int, default=40)
     parser.add_argument("--alphas", type=float, nargs="+", default=[0, 8])
     parser.add_argument(
@@ -169,7 +177,9 @@ def main():
     parser.add_argument(
         "--results-file",
         type=Path,
-        default=Path(__file__).resolve().parent / "results" / "position_scope_openended.jsonl",
+        default=Path(__file__).resolve().parent
+        / "results"
+        / "position_scope_openended.jsonl",
     )
     args = parser.parse_args()
 
@@ -180,7 +190,9 @@ def main():
     num_generations = args.num_generations
     prompt_label = normalize_prompt_label(args.prompt_label)
     prompt_text = args.prompt_text
-    concepts = [c.lower() for c in args.concepts] if args.concepts else CONCEPT_WORDS[:10]
+    concepts = (
+        [c.lower() for c in args.concepts] if args.concepts else CONCEPT_WORDS[:10]
+    )
 
     results_file = args.results_file
     results_file.parent.mkdir(parents=True, exist_ok=True)
@@ -235,7 +247,12 @@ def main():
                         for attempt in range(1, MAX_RETRIES + 1):
                             try:
                                 response = generate_with_scope(
-                                    model, prompt_text, layer, steering_vec, alpha, scope
+                                    model,
+                                    prompt_text,
+                                    layer,
+                                    steering_vec,
+                                    alpha,
+                                    scope,
                                 )
                                 break
                             except Exception as exc:
@@ -264,21 +281,39 @@ def main():
                             rng.shuffle(word_list)
                             judge_prompt = JUDGE_ID_PROMPT.format(
                                 response=response,
-                                word_list="\n".join(f"- {w.capitalize()}" for w in word_list),
+                                word_list="\n".join(
+                                    f"- {w.capitalize()}" for w in word_list
+                                ),
                             )
-                            id_answer = call_llm_judge(judge_prompt).lower().strip().rstrip(".")
+                            id_answer = (
+                                call_llm_judge(judge_prompt).lower().strip().rstrip(".")
+                            )
                             id_correct = id_answer == concept.lower()
                         except Exception as exc:
-                            log.warning("Judge ID failed for %s/%s/%s: %s", concept, scope, alpha, exc)
+                            log.warning(
+                                "Judge ID failed for %s/%s/%s: %s",
+                                concept,
+                                scope,
+                                alpha,
+                                exc,
+                            )
                             id_answer = "ERROR"
                             id_correct = False
 
                         try:
-                            coh_prompt = JUDGE_COHERENCE_PROMPT.format(response=response)
+                            coh_prompt = JUDGE_COHERENCE_PROMPT.format(
+                                response=response
+                            )
                             coh_answer = call_llm_judge(coh_prompt).upper().strip()
                             coherent = coh_answer.startswith("YES")
                         except Exception as exc:
-                            log.warning("Judge coherence failed for %s/%s/%s: %s", concept, scope, alpha, exc)
+                            log.warning(
+                                "Judge coherence failed for %s/%s/%s: %s",
+                                concept,
+                                scope,
+                                alpha,
+                                exc,
+                            )
                             coherent = True
 
                         row = {

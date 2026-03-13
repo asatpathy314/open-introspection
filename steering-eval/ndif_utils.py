@@ -25,6 +25,7 @@ log = logging.getLogger(__name__)
 def setup_ndif(model_id: str = MODEL_ID) -> nnsight.LanguageModel:
     """Initialize NDIF connection and return model handle."""
     from dotenv import load_dotenv
+
     load_dotenv()
 
     api_key = os.environ.get("NDIF_API_KEY")

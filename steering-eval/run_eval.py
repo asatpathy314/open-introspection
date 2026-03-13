@@ -24,7 +24,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from config import CONCEPT_WORDS, FIGURES_DIR, MODEL_ID, RESULTS_DIR, VECTOR_DIR
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
+)
 log = logging.getLogger("steering-eval")
 
 SCRIPT_DIR = Path(__file__).parent
@@ -43,7 +45,10 @@ def run_script(script: str, extra_args: list[str] | None = None):
 
 def step_extract(args):
     import os
-    n_existing = len(list(VECTOR_DIR.glob("*_all_layers.pt"))) if VECTOR_DIR.exists() else 0
+
+    n_existing = (
+        len(list(VECTOR_DIR.glob("*_all_layers.pt"))) if VECTOR_DIR.exists() else 0
+    )
     if n_existing >= 50 and not args.force:
         log.info("All 50 vectors present in %s. Use --force to re-extract.", VECTOR_DIR)
         return
@@ -51,16 +56,22 @@ def step_extract(args):
     env_args = f"MODEL={MODEL_ID} OUTPUT_DIR={VECTOR_DIR}"
     subprocess.run(
         f"{env_args} {PYTHON} concept-vectors/compute_concept_vectors.py",
-        shell=True, cwd=str(SCRIPT_DIR.parent),
+        shell=True,
+        cwd=str(SCRIPT_DIR.parent),
     )
 
 
 def step_plots(args):
     from plots import (
-        load_jsonl, plot_propensity_curves, plot_layer_heatmap,
-        plot_steerability_distribution, plot_per_sample_violins,
-        plot_anti_steerability, plot_coherence_vs_accuracy,
+        load_jsonl,
+        plot_propensity_curves,
+        plot_layer_heatmap,
+        plot_steerability_distribution,
+        plot_per_sample_violins,
+        plot_anti_steerability,
+        plot_coherence_vs_accuracy,
     )
+
     norm = args.norm or "raw"
 
     mcq_path = RESULTS_DIR / f"level1_mcq_{norm}.jsonl"
@@ -133,13 +144,15 @@ def step_report(args):
             steerable_count += 1
         lines.append(f"| {c} | {s:.4f} | {af:.1%} | {p_values[i]:.4f} | {sig} |")
 
-    lines.extend([
-        "",
-        "## Summary",
-        f"- Steerable (s > 0, p < 0.05 after BH): {steerable_count}/{len(concepts)}",
-        f"- Mean steerability: {np.mean(scores):.4f}",
-        f"- Median steerability: {np.median(scores):.4f}",
-    ])
+    lines.extend(
+        [
+            "",
+            "## Summary",
+            f"- Steerable (s > 0, p < 0.05 after BH): {steerable_count}/{len(concepts)}",
+            f"- Mean steerability: {np.mean(scores):.4f}",
+            f"- Median steerability: {np.median(scores):.4f}",
+        ]
+    )
 
     # Add generation results if available
     gen_path = RESULTS_DIR / f"level2_generation_{norm}.jsonl"
@@ -155,13 +168,15 @@ def step_report(args):
                 id_acc = np.mean([r["id_correct"] for r in steered])
                 mention_rate = np.mean([r["concept_mentioned"] for r in steered])
                 coherence = np.mean([r["coherent"] for r in steered])
-                lines.extend([
-                    "",
-                    "## Generation Evaluation (steered only)",
-                    f"- Identification accuracy: {id_acc:.1%} (chance=10%)",
-                    f"- Concept mention rate: {mention_rate:.1%}",
-                    f"- Coherence rate: {coherence:.1%}",
-                ])
+                lines.extend(
+                    [
+                        "",
+                        "## Generation Evaluation (steered only)",
+                        f"- Identification accuracy: {id_acc:.1%} (chance=10%)",
+                        f"- Concept mention rate: {mention_rate:.1%}",
+                        f"- Coherence rate: {coherence:.1%}",
+                    ]
+                )
 
     # Add likelihood results if available
     delta_path = RESULTS_DIR / f"level3_deltas_{norm}.json"
@@ -174,11 +189,13 @@ def step_report(args):
                 if vals["delta_positive"] > 0 and vals["delta_negative"] < 0:
                     effective += 1
                     break
-        lines.extend([
-            "",
-            "## Likelihood Evaluation",
-            f"- Concepts with effective steering (delta_pos > 0, delta_neg < 0): {effective}/{len(deltas)}",
-        ])
+        lines.extend(
+            [
+                "",
+                "## Likelihood Evaluation",
+                f"- Concepts with effective steering (delta_pos > 0, delta_neg < 0): {effective}/{len(deltas)}",
+            ]
+        )
 
     report_text = "\n".join(lines)
     report_path = RESULTS_DIR / f"report_{norm}.md"
@@ -225,7 +242,17 @@ def main():
     if args.all or args.report:
         step_report(args)
 
-    if not any([args.all, args.extract, args.level1, args.level2, args.level3, args.plots, args.report]):
+    if not any(
+        [
+            args.all,
+            args.extract,
+            args.level1,
+            args.level2,
+            args.level3,
+            args.plots,
+            args.report,
+        ]
+    ):
         parser.print_help()
 
 

@@ -94,15 +94,17 @@ def build_batch_requests(trials: list[dict], judge_model: str) -> list[dict]:
             word=trial["prefill_word"],
             response=trial["followup_response"],
         )
-        requests.append({
-            "custom_id": str(idx),
-            "params": {
-                "model": judge_model,
-                "max_tokens": 4,
-                "temperature": 0.0,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-        })
+        requests.append(
+            {
+                "custom_id": str(idx),
+                "params": {
+                    "model": judge_model,
+                    "max_tokens": 4,
+                    "temperature": 0.0,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+            }
+        )
     return requests
 
 
@@ -176,7 +178,9 @@ def main() -> None:
         handlers=[logging.StreamHandler(sys.stdout)],
     )
 
-    parser = argparse.ArgumentParser(description="LLM judge for prefill detection results")
+    parser = argparse.ArgumentParser(
+        description="LLM judge for prefill detection results"
+    )
     parser.add_argument(
         "--input-file",
         type=Path,
@@ -215,7 +219,9 @@ def main() -> None:
     batch_ids: list[str] = []
 
     # Initial batch
-    batch_id, succeeded, failed = submit_and_poll(client, all_requests, args.judge_model)
+    batch_id, succeeded, failed = submit_and_poll(
+        client, all_requests, args.judge_model
+    )
     batch_ids.append(batch_id)
     judgments: dict[int, str] = {int(k): v for k, v in succeeded.items()}
 
@@ -226,7 +232,9 @@ def main() -> None:
             break
         log.info(f"Retry {retry}/{MAX_RETRIES}: {len(failed)} failed results")
         retry_requests = [requests_by_id[cid] for cid in failed]
-        batch_id, succeeded, failed = submit_and_poll(client, retry_requests, args.judge_model)
+        batch_id, succeeded, failed = submit_and_poll(
+            client, retry_requests, args.judge_model
+        )
         batch_ids.append(batch_id)
         for k, v in succeeded.items():
             judgments[int(k)] = v
@@ -234,13 +242,17 @@ def main() -> None:
     # Any still-failed trials keep their original regex judgment
     for cid in failed:
         idx = int(cid)
-        log.warning(f"Trial {idx} failed after {MAX_RETRIES} retries, keeping original judgment")
+        log.warning(
+            f"Trial {idx} failed after {MAX_RETRIES} retries, keeping original judgment"
+        )
         judgments[idx] = trials[idx]["judgment"]
 
     # Write re-judged results
     suffix = model_short_name(args.judge_model)
     output_file = args.output_file or (OUTPUT_DIR / f"results_{suffix}.jsonl")
-    metadata_file = args.metadata_file or output_file.with_name(f"{output_file.stem}_metadata.json")
+    metadata_file = args.metadata_file or output_file.with_name(
+        f"{output_file.stem}_metadata.json"
+    )
 
     with open(output_file, "w") as f:
         for idx, trial in enumerate(trials):
