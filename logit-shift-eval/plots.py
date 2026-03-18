@@ -16,8 +16,12 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
+from matplotlib.backends.backend_pdf import PdfPages
 
 sys.path.insert(0, str(Path(__file__).parent))
+
+import torch
+from scipy import stats
 
 from config import (
     ABSTRACT_CONCEPTS,
@@ -29,6 +33,7 @@ from config import (
     K_PRIMARY,
     K_VALUES,
     RESULTS_DIR,
+    VECTOR_DIR,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -46,6 +51,44 @@ def _save(fig, name: str):
     plt.close(fig)
     log.info("Saved %s", path)
     return path
+
+
+def _compose_image_row(image_paths: list[Path], name: str, titles: list[str] | None = None) -> Path | None:
+    """Compose existing images into a single horizontal summary figure."""
+    valid = [p for p in image_paths if p and p.exists()]
+    if not valid:
+        return None
+
+    fig, axes = plt.subplots(1, len(valid), figsize=(9 * len(valid), 8))
+    if len(valid) == 1:
+        axes = [axes]
+
+    for i, (ax, path) in enumerate(zip(axes, valid)):
+        ax.imshow(plt.imread(path))
+        ax.axis("off")
+        if titles and i < len(titles):
+            ax.set_title(titles[i], fontsize=11)
+
+    fig.tight_layout()
+    return _save(fig, name)
+
+
+def _save_combined_pdf(image_paths: list[Path], output_path: Path):
+    """Save one PNG per page into a combined PDF bundle."""
+    valid = [p for p in image_paths if p and p.exists()]
+    if not valid:
+        return
+
+    with PdfPages(output_path) as pdf:
+        for path in valid:
+            fig, ax = plt.subplots(figsize=(11, 8.5))
+            ax.imshow(plt.imread(path))
+            ax.axis("off")
+            ax.set_title(path.name, fontsize=10)
+            fig.tight_layout()
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
+    log.info("Saved %s", output_path)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -273,8 +316,64 @@ def plot_real_vs_random(analysis: dict, injection: str) -> Path:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+def _build_specificity_array(matrix: dict, concepts: list[str]) -> np.ndarray:
+    n = len(concepts)
+    mat = np.zeros((n, n))
+    for i, inj_c in enumerate(concepts):
+        for j, tgt_c in enumerate(concepts):
+            mat[i, j] = matrix.get(inj_c, {}).get(tgt_c, 0)
+    return mat
+
+
+def _column_correct(mat: np.ndarray) -> np.ndarray:
+    """Subtract column means to remove per-token-set baseline response.
+
+    Each column j captures the average logit shift of concept j's token set
+    across all injected vectors.  Subtracting that mean leaves only the
+    above-average boost that a specific injected vector gives to that token set.
+    """
+    return mat - mat.mean(axis=0, keepdims=True)
+
+
+def plot_mean_propensity_matrix(analysis: dict, injection: str, column_corrected: bool = False) -> Path:
+    """Heatmap of alpha-averaged mean propensities.
+
+    This is descriptive only. Because it averages across symmetric positive and
+    negative alphas, it mainly shows token-set baseline sensitivity rather than
+    directional steerability.
+    """
+    key = f"mean_propensity_matrix_{injection}"
+    matrix = analysis.get(key, {})
+    if not matrix:
+        log.warning("No mean propensity matrix for %s", injection)
+        return None
+
+    concepts = [c for c in CONCEPT_WORDS if c in matrix]
+    mat = _build_specificity_array(matrix, concepts)
+    suffix = "column_corrected" if column_corrected else "raw"
+    title_suffix = "column-corrected" if column_corrected else "raw"
+    colorbar_label = "Mean propensity"
+    if column_corrected:
+        mat = _column_correct(mat)
+        colorbar_label = "Column-corrected mean propensity"
+
+    fig, ax = plt.subplots(figsize=(16, 14))
+    vmax = np.percentile(np.abs(mat), 95)
+    im = ax.imshow(mat, cmap="RdBu_r", vmin=-vmax, vmax=vmax, aspect="auto")
+    ax.set_xticks(range(len(concepts)))
+    ax.set_xticklabels(concepts, rotation=90, fontsize=6)
+    ax.set_yticks(range(len(concepts)))
+    ax.set_yticklabels(concepts, fontsize=6)
+    ax.set_xlabel("Target Concept Token Set")
+    ax.set_ylabel("Injected Concept Vector")
+    plt.colorbar(im, ax=ax, label=colorbar_label)
+    ax.set_title(f"Mean Propensity Matrix ({injection}, {title_suffix})")
+
+    return _save(fig, f"mean_propensity_matrix_{suffix}_{injection}.png")
+
+
 def plot_specificity_matrix(analysis: dict, injection: str, normalized: bool = False) -> Path:
-    """50x50 heatmap of cross-concept logit shifts."""
+    """50x50 heatmap of cross-concept steerability slopes."""
     suffix = "normalized" if normalized else "raw"
     key = f"specificity_matrix_normalized_{injection}" if normalized else f"specificity_matrix_{injection}"
     matrix = analysis.get(key, {})
@@ -282,27 +381,91 @@ def plot_specificity_matrix(analysis: dict, injection: str, normalized: bool = F
         log.warning("No specificity matrix for %s (%s)", injection, suffix)
         return None
 
-    # Build numpy matrix
     concepts = [c for c in CONCEPT_WORDS if c in matrix]
-    n = len(concepts)
-    mat = np.zeros((n, n))
-    for i, inj_c in enumerate(concepts):
-        for j, tgt_c in enumerate(concepts):
-            mat[i, j] = matrix.get(inj_c, {}).get(tgt_c, 0)
+    mat = _build_specificity_array(matrix, concepts)
+    dominance = analysis.get(f"specificity_dominance_{injection}", {})
+    mean_diag = dominance.get("mean_diagonal")
+    mean_off = dominance.get("mean_off_diagonal")
 
     fig, ax = plt.subplots(figsize=(16, 14))
     vmax = np.percentile(np.abs(mat), 95) if not normalized else 2.0
     im = ax.imshow(mat, cmap="RdBu_r", vmin=-vmax, vmax=vmax, aspect="auto")
-    ax.set_xticks(range(n))
+    ax.set_xticks(range(len(concepts)))
     ax.set_xticklabels(concepts, rotation=90, fontsize=6)
-    ax.set_yticks(range(n))
+    ax.set_yticks(range(len(concepts)))
     ax.set_yticklabels(concepts, fontsize=6)
     ax.set_xlabel("Target Concept Token Set")
     ax.set_ylabel("Injected Concept Vector")
-    plt.colorbar(im, ax=ax, label="Mean Logit Shift" if not normalized else "Normalized Shift")
-    ax.set_title(f"Cross-Concept Specificity ({injection}, {suffix})")
+    plt.colorbar(im, ax=ax, label="Mean propensity slope dprop/dalpha" if not normalized else "Row-normalized slope")
+    if mean_diag is not None and mean_off is not None:
+        ax.set_title(
+            f"Cross-Concept Specificity ({injection}, {suffix})\n"
+            f"mean diagonal={mean_diag:.3f}, mean off-diagonal={mean_off:.3f}"
+        )
+    else:
+        ax.set_title(f"Cross-Concept Specificity ({injection}, {suffix})")
 
     return _save(fig, f"specificity_matrix_{suffix}_{injection}.png")
+
+
+def plot_specificity_matrix_column_corrected(analysis: dict, injection: str) -> Path:
+    """50x50 heatmap with column means subtracted.
+
+    Column correction removes the per-token-set baseline response: the average
+    logit shift that a given concept's token set receives across *all* injected
+    vectors.  What remains is the above-average boost that each specific vector
+    gives to each token set, making diagonal dominance a cleaner test of
+    concept specificity.
+    """
+    matrix = analysis.get(f"specificity_matrix_{injection}", {})
+    if not matrix:
+        log.warning("No specificity matrix for %s", injection)
+        return None
+
+    concepts = [c for c in CONCEPT_WORDS if c in matrix]
+    mat = _build_specificity_array(matrix, concepts)
+    mat_cc = _column_correct(mat)
+
+    # Diagonal values after correction
+    diag = np.diag(mat_cc)
+    off_diag = mat_cc[~np.eye(len(concepts), dtype=bool)]
+    mean_diag = float(np.mean(diag))
+    mean_off = float(np.mean(off_diag))
+
+    fig, axes = plt.subplots(1, 2, figsize=(20, 8),
+                             gridspec_kw={"width_ratios": [3, 1]})
+
+    # Left: heatmap
+    ax = axes[0]
+    vmax = np.percentile(np.abs(mat_cc), 95)
+    im = ax.imshow(mat_cc, cmap="RdBu_r", vmin=-vmax, vmax=vmax, aspect="auto")
+    ax.set_xticks(range(len(concepts)))
+    ax.set_xticklabels(concepts, rotation=90, fontsize=6)
+    ax.set_yticks(range(len(concepts)))
+    ax.set_yticklabels(concepts, fontsize=6)
+    ax.set_xlabel("Target Concept Token Set")
+    ax.set_ylabel("Injected Concept Vector")
+    plt.colorbar(im, ax=ax, label="Column-corrected propensity slope")
+    ax.set_title(
+        f"Column-Corrected Specificity ({injection})\n"
+        f"mean diagonal={mean_diag:.3f}, mean off-diagonal={mean_off:.3f}"
+    )
+
+    # Right: sorted diagonal values
+    ax2 = axes[1]
+    order = np.argsort(diag)
+    colors = ["steelblue" if diag[i] > 0 else "salmon" for i in order]
+    ax2.barh(range(len(concepts)), diag[order], color=colors, edgecolor="none", height=0.8)
+    ax2.set_yticks(range(len(concepts)))
+    ax2.set_yticklabels([concepts[i] for i in order], fontsize=6)
+    ax2.axvline(0, color="black", lw=0.8)
+    ax2.axvline(mean_off, color="gray", lw=1, ls="--", label=f"mean off-diag={mean_off:.3f}")
+    ax2.set_xlabel("Column-corrected diagonal slope")
+    ax2.set_title("Per-concept self-boost\n(above average)")
+    ax2.legend(fontsize=7)
+
+    plt.tight_layout()
+    return _save(fig, f"specificity_matrix_column_corrected_{injection}.png")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -322,7 +485,7 @@ def plot_abstract_vs_concrete(analysis: dict, injection: str) -> Path:
     fig, ax = plt.subplots(figsize=(6, 5))
     parts = ax.boxplot(
         [concrete_vals, abstract_vals],
-        labels=["Concrete", "Abstract"],
+        tick_labels=["Concrete", "Abstract"],
         patch_artist=True,
         widths=0.5,
     )
@@ -395,6 +558,178 @@ def plot_k_sensitivity(analysis: dict, injection: str) -> Path:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 9. Entropy-Steerability Correlation (Test 1)
+# ═══════════════════════════════════════════════════════════════════════════
+
+_CAT_COLORS = {"abstract": "#e67e22", "concrete": "#2980b9"}
+
+
+def _concept_color(c: str) -> str:
+    return _CAT_COLORS["abstract"] if c in ABSTRACT_CONCEPTS else _CAT_COLORS["concrete"]
+
+
+
+def plot_entropy_steerability_correlation(main_results: list[dict], analysis: dict) -> Path:
+    """Scatter of ΔH (max alpha vs baseline) vs propensity steerability per concept.
+
+    Tests whether steerability is just a proxy for distribution spreading:
+    if so, expect strong positive Spearman correlation.  A negative or near-zero
+    correlation means the two effects are dissociable.
+
+    x-axis: mean H(α=max) − H(α=0) across prompts — the entropy increase the
+    vector produces at peak steering strength.
+    """
+    max_alpha = max(ALPHAS)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    for ax, injection in zip(axes, INJECTION_CONDITIONS):
+        inj_rows = [r for r in main_results if r["injection"] == injection]
+
+        # Baseline entropy per (concept, prompt)
+        baseline_ent = defaultdict(dict)
+        for r in inj_rows:
+            if r["alpha"] == 0:
+                baseline_ent[r["concept"]][r["prompt_idx"]] = r["entropy"]
+
+        # ΔH at max alpha per concept
+        delta_h_by_cp = defaultdict(list)
+        for r in inj_rows:
+            if r["alpha"] == max_alpha:
+                bl = baseline_ent[r["concept"]].get(r["prompt_idx"])
+                if bl is not None:
+                    delta_h_by_cp[r["concept"]].append(r["entropy"] - bl)
+        delta_h = {c: float(np.mean(delta_h_by_cp[c])) if delta_h_by_cp[c] else 0.0
+                   for c in CONCEPT_WORDS}
+
+        # Propensity steerability from pre-computed analysis
+        steer = analysis.get(f"steerability_{injection}", {})
+        prop_slopes = {c: steer[c]["steerability"] for c in CONCEPT_WORDS if c in steer}
+
+        x = np.array([delta_h[c] for c in CONCEPT_WORDS])
+        y = np.array([prop_slopes.get(c, 0) for c in CONCEPT_WORDS])
+        rho, p = stats.spearmanr(x, y)
+
+        ax.scatter(x, y, c=[_concept_color(c) for c in CONCEPT_WORDS],
+                   alpha=0.75, s=45, edgecolors="none")
+        for c in CONCEPT_WORDS:
+            ax.annotate(c, (delta_h[c], prop_slopes.get(c, 0)), fontsize=5, alpha=0.55)
+
+        m, b = np.polyfit(x, y, 1)
+        xl = np.linspace(x.min(), x.max(), 100)
+        ax.plot(xl, m * xl + b, "k--", lw=1)
+        ax.axhline(0, color="gray", lw=0.5, ls="--")
+        ax.axvline(0, color="gray", lw=0.5, ls="--")
+        ax.set_xlabel(f"ΔH at α={max_alpha}  (H_steered − H_baseline)", fontsize=10)
+        ax.set_ylabel("Propensity steerability (dprop/dα)", fontsize=10)
+        ax.set_title(f"{injection}\nSpearman ρ={rho:.3f}, p={p:.4f}", fontsize=10)
+
+    from matplotlib.patches import Patch
+    axes[0].legend(handles=[Patch(fc=_CAT_COLORS["abstract"], label="abstract"),
+                             Patch(fc=_CAT_COLORS["concrete"], label="concrete")], fontsize=8)
+    fig.suptitle("Test 1: Does steerability correlate with entropy increase?", fontsize=12, y=1.01)
+    fig.tight_layout()
+    return _save(fig, "entropy_steerability_correlation.png")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 10. Cosine-Independent Token Set Propensity (Test 3)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def plot_cosine_token_propensity(layer: int) -> Path:
+    """Expected propensity under cosine vs projection token sets (linear approx).
+
+    Projection token sets are chosen by concept_vector @ W_U, so they are
+    circular — those tokens are precisely where the vector has the largest
+    effect.  Cosine token sets use embedding-space similarity and are defined
+    independently of the injected vector.
+
+    Linear approximation: Δlogit_i ≈ α·(v @ W_U[i]), so expected propensity
+    under any token set T is mean(v @ W_U[T]) − mean(v @ W_U[T_baseline]).
+    """
+    W_U = torch.load(RESULTS_DIR / "unembed.pt", map_location="cpu", weights_only=True).float()
+
+    with open(RESULTS_DIR / "token_sets.json") as f:
+        ts_data = json.load(f)
+
+    layer_str = str(layer)
+    baseline_tokens = ts_data["baseline_tokens"]
+    W_baseline = W_U[baseline_tokens].mean(dim=0)
+
+    proj_props, cos_props, overlaps, concepts_ok = [], [], [], []
+    for concept in CONCEPT_WORDS:
+        proj_tokens = ts_data["token_sets"].get(concept, {}).get(layer_str, {}).get(str(K_PRIMARY), [])
+        cos_tokens = ts_data["token_sets_cosine"].get(concept, {}).get(layer_str, [])[:K_PRIMARY]
+        if not proj_tokens or not cos_tokens:
+            continue
+
+        vec_path = VECTOR_DIR / f"{concept.lower().replace(' ', '_')}_all_layers.pt"
+        if not vec_path.exists():
+            continue
+        v = torch.load(vec_path, map_location="cpu", weights_only=True).float()[layer]
+
+        def _prop(toks):
+            return float((v @ W_U[toks].T).mean() - (v @ W_baseline))
+
+        proj_props.append(_prop(proj_tokens))
+        cos_props.append(_prop(cos_tokens))
+        overlaps.append(len(set(proj_tokens) & set(cos_tokens)) / K_PRIMARY)
+        concepts_ok.append(concept)
+
+    x = np.array(proj_props)
+    y = np.array(cos_props)
+    rho, p = stats.spearmanr(x, y)
+    ratios = y / (np.abs(x) + 1e-12)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Left: scatter proj vs cosine expected propensity, coloured by overlap
+    ax = axes[0]
+    sc = ax.scatter(x, y, c=overlaps, cmap="viridis", s=50, edgecolors="none", alpha=0.85)
+    for i, c in enumerate(concepts_ok):
+        ax.annotate(c, (x[i], y[i]), fontsize=5, alpha=0.55)
+    lim = max(np.abs(x).max(), np.abs(y).max()) * 1.1
+    ax.plot([-lim, lim], [-lim, lim], "k--", lw=0.8, label="y=x")
+    ax.axhline(0, color="gray", lw=0.5, ls="--")
+    ax.axvline(0, color="gray", lw=0.5, ls="--")
+    ax.set_xlabel("Proj token set: v @ W_U[T_proj]", fontsize=9)
+    ax.set_ylabel("Cosine token set: v @ W_U[T_cos]", fontsize=9)
+    ax.set_title(
+        f"Layer {layer} — expected propensity\nSpearman ρ={rho:.3f}, p={p:.4f} "
+        f"| same-sign: {sum(xi*yi>0 for xi,yi in zip(x,y))}/{len(x)}",
+        fontsize=9,
+    )
+    plt.colorbar(sc, ax=ax, label="Token set Jaccard overlap")
+    ax.legend(fontsize=8)
+
+    # Right: cos/proj ratio sorted, coloured by abstract/concrete
+    ax2 = axes[1]
+    order = np.argsort(ratios)
+    rc = [_concept_color(concepts_ok[i]) for i in order]
+    ax2.barh(range(len(concepts_ok)), ratios[order], color=rc, edgecolor="none", height=0.8)
+    ax2.axvline(1.0, color="black", lw=1, ls="--", label="ratio = 1")
+    ax2.axvline(0.0, color="gray", lw=0.5)
+    ax2.set_yticks(range(len(concepts_ok)))
+    ax2.set_yticklabels([concepts_ok[i] for i in order], fontsize=6)
+    ax2.set_xlabel("cos / proj expected propensity", fontsize=9)
+    ax2.set_title(
+        f"Signal retained in cosine tokens\nmedian ratio={float(np.median(ratios)):.3f}, "
+        f"mean overlap={float(np.mean(overlaps)):.2f}",
+        fontsize=9,
+    )
+    from matplotlib.patches import Patch
+    ax2.legend(handles=[Patch(fc=_CAT_COLORS["abstract"], label="abstract"),
+                        Patch(fc=_CAT_COLORS["concrete"], label="concrete"),
+                        plt.Line2D([0], [0], color="k", ls="--", label="ratio=1")],
+               fontsize=7)
+
+    fig.suptitle("Test 3: Cosine-independent token sets (linear approx, no new passes)",
+                 fontsize=11, y=1.01)
+    fig.tight_layout()
+    return _save(fig, "cosine_token_propensity.png")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Generate All Plots
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -413,35 +748,80 @@ def generate_all_plots(layer: int):
 
     main_path = RESULTS_DIR / f"main_sweep_layer{layer}.jsonl"
     main_results = load_jsonl(main_path) if main_path.exists() else []
+    generated_paths = []
 
     # Layer selection
     if "layer_selection" in analysis:
-        plot_layer_selection(analysis)
+        path = plot_layer_selection(analysis)
+        if path:
+            generated_paths.append(path)
 
     for injection in INJECTION_CONDITIONS:
         # Steerability bars
         if f"steerability_{injection}" in analysis:
-            plot_steerability_bars(analysis, injection)
+            path = plot_steerability_bars(analysis, injection)
+            if path:
+                generated_paths.append(path)
 
         # Dose-response
         if main_results:
-            plot_dose_response(main_results, injection)
+            path = plot_dose_response(main_results, injection)
+            if path:
+                generated_paths.append(path)
 
-        # Specificity matrix (raw and normalized)
-        plot_specificity_matrix(analysis, injection, normalized=False)
-        plot_specificity_matrix(analysis, injection, normalized=True)
+        # Mean-propensity artifacts and corrected specificity
+        for path in [
+            plot_mean_propensity_matrix(analysis, injection, column_corrected=False),
+            plot_mean_propensity_matrix(analysis, injection, column_corrected=True),
+            plot_specificity_matrix(analysis, injection, normalized=False),
+            plot_specificity_matrix(analysis, injection, normalized=True),
+            plot_specificity_matrix_column_corrected(analysis, injection),
+        ]:
+            if path:
+                generated_paths.append(path)
 
         # Abstract vs concrete
-        plot_abstract_vs_concrete(analysis, injection)
+        path = plot_abstract_vs_concrete(analysis, injection)
+        if path:
+            generated_paths.append(path)
 
         # K sensitivity
-        plot_k_sensitivity(analysis, injection)
+        path = plot_k_sensitivity(analysis, injection)
+        if path:
+            generated_paths.append(path)
 
         # Real vs random
-        plot_real_vs_random(analysis, injection)
+        path = plot_real_vs_random(analysis, injection)
+        if path:
+            generated_paths.append(path)
 
     # Injection comparison
-    plot_injection_comparison(analysis)
+    path = plot_injection_comparison(analysis)
+    if path:
+        generated_paths.append(path)
+
+    # Entropy confound tests
+    if main_results:
+        path = plot_entropy_steerability_correlation(main_results, analysis)
+        if path:
+            generated_paths.append(path)
+    path = plot_cosine_token_propensity(layer)
+    if path:
+        generated_paths.append(path)
+
+    # Refresh combined artifacts so old files do not go stale.
+    summary = _compose_image_row(
+        [
+            FIGURES_DIR / "specificity_matrix_column_corrected_all_positions.png",
+            FIGURES_DIR / "specificity_matrix_column_corrected_last_token.png",
+        ],
+        "specificity_column_corrected.png",
+        titles=["all_positions", "last_token"],
+    )
+    if summary:
+        generated_paths.append(summary)
+
+    _save_combined_pdf(generated_paths, RESULTS_DIR / "figures_combined.pdf")
 
     log.info("All plots saved to %s", FIGURES_DIR)
 

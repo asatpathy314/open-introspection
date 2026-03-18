@@ -208,17 +208,47 @@ def compute_steerability(
     return steerability
 
 
+def summarize_steerability(steerability: dict[str, dict]) -> dict:
+    """Compact summary for a steerability table."""
+    p_values = [steerability[c]["p_value"] for c in CONCEPT_WORDS]
+    significant = benjamini_hochberg(p_values)
+    slopes = []
+    n_sig = 0
+    n_any_nonpositive = 0
+    for i, concept in enumerate(CONCEPT_WORDS):
+        steerability[concept]["bh_significant"] = significant[i]
+        slope = steerability[concept]["steerability"]
+        slopes.append(slope)
+        if significant[i] and slope > 0:
+            n_sig += 1
+        if any(s <= 0 for s in steerability[concept].get("per_prompt_slopes", [])):
+            n_any_nonpositive += 1
+
+    return {
+        "mean_steerability": float(np.mean(slopes)) if slopes else 0.0,
+        "median_steerability": float(np.median(slopes)) if slopes else 0.0,
+        "min_steerability": float(np.min(slopes)) if slopes else 0.0,
+        "max_steerability": float(np.max(slopes)) if slopes else 0.0,
+        "n_significant": n_sig,
+        "n_concepts": len(slopes),
+        "n_concepts_with_any_nonpositive_prompt_slope": n_any_nonpositive,
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Cross-Concept Specificity Matrix
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def compute_specificity_matrix(
+def compute_mean_propensity_matrix(
     results: list[dict], injection: str, alpha: float | None = None
 ) -> dict[str, dict[str, float]]:
-    """Compute 50x50 cross-concept specificity matrix.
+    """Compute 50x50 matrix of mean propensities.
 
     Returns {injected_concept: {target_concept: mean_propensity}}.
+    This is descriptive, but it is not the main specificity statistic because
+    averaging across symmetric positive/negative alphas can cancel directional
+    steering effects.
     """
     filtered = [r for r in results if r["injection"] == injection]
     if alpha is not None:
@@ -235,6 +265,40 @@ def compute_specificity_matrix(
             matrix[injected] = {
                 t: float(np.mean(vs)) for t, vs in agg[injected].items()
             }
+    return matrix
+
+
+def compute_specificity_matrix(results: list[dict], injection: str) -> dict[str, dict[str, float]]:
+    """Compute 50x50 cross-concept specificity as slope vs alpha.
+
+    Entry (i, j) is the mean per-prompt slope of target concept j's propensity
+    as the injected concept i is scaled over alpha. This matches the
+    steerability definition used elsewhere in the analysis.
+    """
+    filtered = [r for r in results if r["injection"] == injection]
+
+    grouped = defaultdict(list)
+    for r in filtered:
+        inj = r["concept"]
+        pi = r["prompt_idx"]
+        for target, prop in r["cross_concept"].items():
+            grouped[(inj, target, pi)].append((r["alpha"], prop))
+
+    matrix = {}
+    for injected in CONCEPT_WORDS:
+        row = {}
+        for target in CONCEPT_WORDS:
+            per_prompt_slopes = []
+            for prompt_idx in range(max((r["prompt_idx"] for r in filtered), default=-1) + 1):
+                points = grouped.get((injected, target, prompt_idx), [])
+                if len(points) >= 2:
+                    xs = [p[0] for p in points]
+                    ys = [p[1] for p in points]
+                    per_prompt_slopes.append(float(np.polyfit(xs, ys, 1)[0]))
+            if per_prompt_slopes:
+                row[target] = float(np.mean(per_prompt_slopes))
+        if row:
+            matrix[injected] = row
     return matrix
 
 
@@ -395,6 +459,31 @@ def flag_entropy_breakdown(results: list[dict], injection: str,
     }
 
 
+def collect_entropy_flagged_keys(
+    results: list[dict], injection: str, threshold_factor: float = 3.0
+) -> set[tuple[str, int, float]]:
+    """Return the full set of (concept, prompt_idx, alpha) entropy outliers."""
+    filtered = [r for r in results if r["injection"] == injection]
+
+    baseline_entropy = defaultdict(list)
+    for r in filtered:
+        if r["alpha"] == 0:
+            baseline_entropy[r["prompt_idx"]].append(r["entropy"])
+    baseline_mean = {pi: np.mean(vs) for pi, vs in baseline_entropy.items()}
+
+    flagged = set()
+    for r in filtered:
+        if r["alpha"] == 0:
+            continue
+        bl = baseline_mean.get(r["prompt_idx"])
+        if bl is None or bl == 0:
+            continue
+        ratio = r["entropy"] / bl
+        if ratio < 1 / threshold_factor or ratio > threshold_factor:
+            flagged.add((r["concept"], r["prompt_idx"], r["alpha"]))
+    return flagged
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # K Sensitivity Analysis
 # ═══════════════════════════════════════════════════════════════════════════
@@ -544,12 +633,59 @@ def validate_prompts(layer: int) -> dict:
     return out
 
 
+def baseline_token_diagnostics(layer: int) -> dict:
+    """Compare the sampled baseline token set against the full-vocab logit distribution."""
+    ts_path = RESULTS_DIR / "token_sets.json"
+    baseline_logits_path = RESULTS_DIR / f"baseline_logits_layer{layer}.pt"
+    if not ts_path.exists() or not baseline_logits_path.exists():
+        return {"error": "token_sets.json or baseline logits not found"}
+
+    with open(ts_path) as f:
+        ts_data = json.load(f)
+    baseline_tokens = ts_data.get("baseline_tokens", [])
+    if not baseline_tokens:
+        return {"error": "baseline token set not found"}
+
+    bl_logits = torch.load(baseline_logits_path, map_location="cpu", weights_only=True)
+    per_prompt = []
+    for prompt_idx in sorted(bl_logits.keys()):
+        logits = bl_logits[prompt_idx].float()
+        baseline_mean = float(logits[baseline_tokens].mean().item())
+        vocab_mean = float(logits.mean().item())
+        vocab_median = float(logits.median().item())
+        percentile = float((logits <= baseline_mean).float().mean().item())
+        per_prompt.append({
+            "prompt_idx": int(prompt_idx),
+            "baseline_mean_logit": baseline_mean,
+            "vocab_mean_logit": vocab_mean,
+            "vocab_median_logit": vocab_median,
+            "baseline_mean_percentile_in_vocab": percentile,
+            "baseline_minus_vocab_mean": baseline_mean - vocab_mean,
+            "baseline_minus_vocab_median": baseline_mean - vocab_median,
+        })
+
+    mean = lambda key: float(np.mean([row[key] for row in per_prompt])) if per_prompt else 0.0
+    return {
+        "method": ts_data.get("baseline_token_method", {"type": "legacy_low_index_tokens"}),
+        "n_baseline_tokens": len(baseline_tokens),
+        "summary": {
+            "mean_baseline_logit": mean("baseline_mean_logit"),
+            "mean_vocab_logit": mean("vocab_mean_logit"),
+            "mean_vocab_median_logit": mean("vocab_median_logit"),
+            "mean_baseline_percentile_in_vocab": mean("baseline_mean_percentile_in_vocab"),
+            "mean_baseline_minus_vocab_mean": mean("baseline_minus_vocab_mean"),
+            "mean_baseline_minus_vocab_median": mean("baseline_minus_vocab_median"),
+        },
+        "per_prompt": per_prompt,
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Token Set Quality Report
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def token_set_quality_report() -> dict:
+def token_set_quality_report(layer: int | None = None) -> dict:
     """Report overlap between projection and cosine token sets."""
     ts_path = RESULTS_DIR / "token_sets.json"
     if not ts_path.exists():
@@ -559,7 +695,10 @@ def token_set_quality_report() -> dict:
         data = json.load(f)
 
     layers = data["layers"]
-    rep_layer = str(40 if 40 in layers else layers[len(layers) // 2])
+    if layer is not None and layer in layers:
+        rep_layer = str(layer)
+    else:
+        rep_layer = str(40 if 40 in layers else layers[len(layers) // 2])
 
     overlaps = {}
     for concept in CONCEPT_WORDS:
@@ -601,7 +740,7 @@ def run_full_analysis(layer: int):
                      inj, best["layer"], best["mean_steerability"])
 
     # Token set quality
-    output["token_set_quality"] = token_set_quality_report()
+    output["token_set_quality"] = token_set_quality_report(layer)
 
     if not main_path.exists():
         log.error("Main sweep not found: %s", main_path)
@@ -621,25 +760,32 @@ def run_full_analysis(layer: int):
 
         # Steerability
         steer = compute_steerability(main_results, injection)
-        p_values = [steer[c]["p_value"] for c in CONCEPT_WORDS]
-        significant = benjamini_hochberg(p_values)
-        for i, c in enumerate(CONCEPT_WORDS):
-            steer[c]["bh_significant"] = significant[i]
+        steer_summary = summarize_steerability(steer)
         output[f"steerability_{prefix}"] = steer
+        output[f"steerability_summary_{prefix}"] = steer_summary
 
-        n_sig = sum(
-            1 for c in CONCEPT_WORDS
-            if steer[c].get("bh_significant") and steer[c]["steerability"] > 0
+        log.info(
+            "  Significant (BH, slope>0): %d/%d, mean=%.6f",
+            steer_summary["n_significant"],
+            steer_summary["n_concepts"],
+            steer_summary["mean_steerability"],
         )
-        mean_s = np.mean([steer[c]["steerability"] for c in CONCEPT_WORDS])
-        log.info("  Significant (BH, slope>0): %d/%d, mean=%.6f", n_sig, len(CONCEPT_WORDS), mean_s)
+
+        # Small-alpha robustness
+        small_alpha_results = [r for r in main_results if r["alpha"] in (-2, 0, 2)]
+        small_alpha_steer = compute_steerability(small_alpha_results, injection)
+        output[f"steerability_small_alpha_summary_{prefix}"] = summarize_steerability(
+            small_alpha_steer
+        )
 
         # Cross-concept specificity
         spec_steered = compute_specificity_matrix(main_results, injection)
-        spec_baseline = compute_specificity_matrix(main_results, injection, alpha=0)
+        mean_prop = compute_mean_propensity_matrix(main_results, injection)
+        mean_prop_baseline = compute_mean_propensity_matrix(main_results, injection, alpha=0)
         output[f"specificity_matrix_{prefix}"] = spec_steered
         output[f"specificity_matrix_normalized_{prefix}"] = row_normalize_matrix(spec_steered)
-        output[f"specificity_baseline_{prefix}"] = spec_baseline
+        output[f"mean_propensity_matrix_{prefix}"] = mean_prop
+        output[f"mean_propensity_baseline_{prefix}"] = mean_prop_baseline
         output[f"specificity_dominance_{prefix}"] = specificity_diagonal_dominance(spec_steered)
         log.info("  Diagonal dominance: %s", output[f"specificity_dominance_{prefix}"])
 
@@ -669,15 +815,13 @@ def run_full_analysis(layer: int):
 
     # Prompt validation
     output["prompt_validation"] = validate_prompts(layer)
+    output["baseline_token_diagnostics"] = baseline_token_diagnostics(layer)
 
     # Steerability with entropy-breakdown points removed
     for injection in INJECTION_CONDITIONS:
         flags = output[f"entropy_flags_{injection}"]
         if flags["n_flagged"] > 0:
-            flagged_keys = {
-                (f["concept"], f["prompt_idx"], f["alpha"])
-                for f in flags.get("flagged_samples", [])
-            }
+            flagged_keys = collect_entropy_flagged_keys(main_results, injection)
             clean_results = [
                 r for r in main_results
                 if (r["concept"], r["prompt_idx"], r["alpha"]) not in flagged_keys
@@ -701,7 +845,7 @@ def run_full_analysis(layer: int):
         steer = output[f"steerability_{injection}"]
         concepts_sorted = sorted(CONCEPT_WORDS, key=lambda c: steer[c]["steerability"], reverse=True)
 
-        n_sig = sum(1 for c in CONCEPT_WORDS if steer[c].get("bh_significant") and steer[c]["steerability"] > 0)
+        n_sig = output[f"steerability_summary_{injection}"]["n_significant"]
         print(f"\n--- {injection} ---")
         print(f"Significant: {n_sig}/{len(CONCEPT_WORDS)}")
         print(f"{'Concept':<20} {'Steerability':>12} {'p-value':>10} {'Sig':>5} {'Category':>10}")
