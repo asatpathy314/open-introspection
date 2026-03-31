@@ -92,6 +92,63 @@ INJECTION_CONDITIONS = ["all_positions", "last_token"]
 K_VALUES = [5, 10, 20, 50]
 K_PRIMARY = 20
 N_BASELINE_TOKENS = 200
+TOKEN_SET_FAMILY_DEFAULT = os.environ.get("TOKEN_SET_FAMILY", "projection")
+
+# Independent lexical seed strings for non-circular token sets. These are used
+# to build a semantic centroid in unembedding space without referencing the
+# concept vector under evaluation.
+CONCEPT_LEXICAL_SEEDS = {
+    "dust": ["dust", "dusty", "dirt", "particle"],
+    "satellites": ["satellite", "satellites", "orbit", "orbital"],
+    "trumpets": ["trumpet", "trumpets", "brass", "horn"],
+    "origami": ["origami", "fold", "paper", "crane"],
+    "illusions": ["illusion", "illusions", "mirage", "deceptive"],
+    "cameras": ["camera", "cameras", "lens", "photography"],
+    "lightning": ["lightning", "thunder", "electric", "storm"],
+    "constellations": ["constellation", "constellations", "stars", "astronomy"],
+    "treasures": ["treasure", "treasures", "gold", "precious"],
+    "phones": ["phone", "phones", "telephone", "mobile"],
+    "trees": ["tree", "trees", "forest", "woodland"],
+    "avalanches": ["avalanche", "avalanches", "snow", "landslide"],
+    "mirrors": ["mirror", "mirrors", "reflection", "reflective"],
+    "fountains": ["fountain", "fountains", "water", "spray"],
+    "quarries": ["quarry", "quarries", "stone", "mining"],
+    "sadness": ["sadness", "sad", "sorrow", "grief"],
+    "xylophones": ["xylophone", "xylophones", "percussion", "mallet"],
+    "secrecy": ["secrecy", "secret", "hidden", "covert"],
+    "oceans": ["ocean", "oceans", "sea", "marine"],
+    "information": ["information", "data", "knowledge", "facts"],
+    "deserts": ["desert", "deserts", "arid", "dune"],
+    "kaleidoscopes": ["kaleidoscope", "kaleidoscopes", "prism", "pattern"],
+    "sugar": ["sugar", "sweet", "sugary", "candy"],
+    "vegetables": ["vegetable", "vegetables", "produce", "greens"],
+    "poetry": ["poetry", "poem", "verse", "lyric"],
+    "aquariums": ["aquarium", "aquariums", "fish", "tank"],
+    "bags": ["bag", "bags", "sack", "backpack"],
+    "peace": ["peace", "calm", "tranquil", "harmony"],
+    "caverns": ["cavern", "caverns", "cave", "grotto"],
+    "memories": ["memory", "memories", "nostalgia", "recall"],
+    "frosts": ["frost", "frosts", "icy", "frozen"],
+    "volcanoes": ["volcano", "volcanoes", "lava", "eruption"],
+    "boulders": ["boulder", "boulders", "rock", "stone"],
+    "harmonies": ["harmony", "harmonies", "melodic", "chord"],
+    "masquerades": ["masquerade", "masquerades", "mask", "disguise"],
+    "rubber": ["rubber", "elastic", "latex", "tire"],
+    "plastic": ["plastic", "synthetic", "polymer", "molded"],
+    "blood": ["blood", "bloody", "vein", "crimson"],
+    "amphitheaters": ["amphitheater", "amphitheaters", "theater", "arena"],
+    "contraptions": ["contraption", "contraptions", "gadget", "device"],
+    "youths": ["youth", "youths", "young", "teenage"],
+    "dynasties": ["dynasty", "dynasties", "royal", "lineage"],
+    "snow": ["snow", "snowy", "winter", "blizzard"],
+    "dirigibles": ["dirigible", "dirigibles", "airship", "zeppelin"],
+    "algorithms": ["algorithm", "algorithms", "heuristic", "procedure"],
+    "denim": ["denim", "jeans", "indigo", "fabric"],
+    "monoliths": ["monolith", "monoliths", "pillar", "slab"],
+    "milk": ["milk", "dairy", "creamy", "carton"],
+    "bread": ["bread", "loaf", "bakery", "dough"],
+    "silver": ["silver", "metal", "metallic", "sterling"],
+}
 
 # ── Random controls ──
 N_RANDOM_VECTORS = 20

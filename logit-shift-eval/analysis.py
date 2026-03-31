@@ -30,10 +30,22 @@ from config import (
     K_PRIMARY,
     K_VALUES,
     RESULTS_DIR,
+    TOKEN_SET_FAMILY_DEFAULT,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
+
+
+TOKEN_SET_FAMILY_ALIASES = {
+    "projection": "projection",
+    "proj": "projection",
+    "lexical_cosine": "lexical_cosine",
+    "lexical": "lexical_cosine",
+    "independent": "lexical_cosine",
+    "concept_piece_cosine": "concept_piece_cosine",
+    "cosine": "concept_piece_cosine",
+}
 
 
 # ── I/O ──
@@ -59,6 +71,56 @@ def _json_convert(obj):
     if isinstance(obj, np.bool_):
         return bool(obj)
     raise TypeError(f"Not JSON serializable: {type(obj)}")
+
+
+def canonical_token_family(family: str | None) -> str:
+    raw = family or TOKEN_SET_FAMILY_DEFAULT
+    try:
+        return TOKEN_SET_FAMILY_ALIASES[raw]
+    except KeyError as e:
+        valid = ", ".join(sorted(set(TOKEN_SET_FAMILY_ALIASES.values())))
+        raise ValueError(f"Unknown token family '{raw}'. Valid options: {valid}") from e
+
+
+def infer_token_family(results: list[dict]) -> str | None:
+    families = sorted({r.get("token_family") for r in results if r.get("token_family")})
+    if len(families) == 1:
+        return families[0]
+    return None
+
+
+def _token_set_blob_for_family(data: dict, family: str) -> dict:
+    family = canonical_token_family(family)
+    if family == "projection":
+        return data["token_sets"]
+    if family == "lexical_cosine":
+        return data["token_sets_lexical_cosine"]
+    if family == "concept_piece_cosine":
+        return data["token_sets_cosine"]
+    raise ValueError(f"Unsupported token family: {family}")
+
+
+def _tokens_for_k(layer_blob, k: int) -> list[int]:
+    if not layer_blob:
+        return []
+    if isinstance(layer_blob, list):
+        return layer_blob[:k]
+    return layer_blob.get(str(k), [])
+
+
+def _overlap_report(lhs_blob: dict, rhs_blob: dict, rep_layer: str) -> dict:
+    overlaps = {}
+    for concept in CONCEPT_WORDS:
+        lhs = set(_tokens_for_k(lhs_blob.get(concept, {}).get(rep_layer, {}), K_PRIMARY))
+        rhs = set(_tokens_for_k(rhs_blob.get(concept, {}).get(rep_layer, {}), K_PRIMARY))
+        if lhs and rhs:
+            overlaps[concept] = len(lhs & rhs) / K_PRIMARY
+    return {
+        "per_concept_overlap": overlaps,
+        "mean_overlap": float(np.mean(list(overlaps.values()))) if overlaps else 0.0,
+        "min_overlap": float(min(overlaps.values())) if overlaps else 0.0,
+        "max_overlap": float(max(overlaps.values())) if overlaps else 0.0,
+    }
 
 
 # ── BH FDR correction ──
@@ -685,8 +747,8 @@ def baseline_token_diagnostics(layer: int) -> dict:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def token_set_quality_report(layer: int | None = None) -> dict:
-    """Report overlap between projection and cosine token sets."""
+def token_set_quality_report(layer: int | None = None, token_family: str | None = None) -> dict:
+    """Report overlap diagnostics between token-set families."""
     ts_path = RESULTS_DIR / "token_sets.json"
     if not ts_path.exists():
         return {"error": "token_sets.json not found"}
@@ -700,22 +762,46 @@ def token_set_quality_report(layer: int | None = None) -> dict:
     else:
         rep_layer = str(40 if 40 in layers else layers[len(layers) // 2])
 
-    overlaps = {}
-    for concept in CONCEPT_WORDS:
-        proj = set(data["token_sets"].get(concept, {}).get(rep_layer, {}).get(str(K_PRIMARY), []))
-        cos = set(data["token_sets_cosine"].get(concept, {}).get(rep_layer, [])[:K_PRIMARY])
-        if proj and cos:
-            overlap = len(proj & cos) / K_PRIMARY
-            overlaps[concept] = overlap
-
-    return {
+    selected_family = canonical_token_family(token_family)
+    projection_blob = data.get("token_sets", {})
+    concept_piece_blob = data.get("token_sets_cosine", {})
+    lexical_blob = data.get("token_sets_lexical_cosine", {})
+    out = {
         "layer": int(rep_layer),
         "k": K_PRIMARY,
-        "per_concept_overlap": overlaps,
-        "mean_overlap": float(np.mean(list(overlaps.values()))) if overlaps else 0,
-        "min_overlap": float(min(overlaps.values())) if overlaps else 0,
-        "max_overlap": float(max(overlaps.values())) if overlaps else 0,
+        "selected_family": selected_family,
     }
+
+    if projection_blob and concept_piece_blob:
+        out["projection_vs_concept_piece_cosine"] = _overlap_report(
+            projection_blob, concept_piece_blob, rep_layer
+        )
+    if projection_blob and lexical_blob:
+        out["projection_vs_lexical_cosine"] = _overlap_report(
+            projection_blob, lexical_blob, rep_layer
+        )
+    if concept_piece_blob and lexical_blob:
+        out["concept_piece_vs_lexical_cosine"] = _overlap_report(
+            concept_piece_blob, lexical_blob, rep_layer
+        )
+
+    selected_blob = _token_set_blob_for_family(data, selected_family)
+    if selected_family != "projection":
+        out["projection_vs_selected"] = _overlap_report(
+            projection_blob, selected_blob, rep_layer
+        )
+
+    lexical_seed_counts = data.get("lexical_seed_token_ids", {})
+    if lexical_seed_counts:
+        counts = {concept: len(ids) for concept, ids in lexical_seed_counts.items()}
+        out["lexical_seed_token_count"] = {
+            "per_concept": counts,
+            "mean": float(np.mean(list(counts.values()))) if counts else 0.0,
+            "min": int(min(counts.values())) if counts else 0,
+            "max": int(max(counts.values())) if counts else 0,
+        }
+
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -723,7 +809,7 @@ def token_set_quality_report(layer: int | None = None) -> dict:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def run_full_analysis(layer: int):
+def run_full_analysis(layer: int, token_family: str | None = None):
     """Run complete analysis on sweep results at the given layer."""
     main_path = RESULTS_DIR / f"main_sweep_layer{layer}.jsonl"
     random_path = RESULTS_DIR / f"random_sweep_layer{layer}.jsonl"
@@ -739,20 +825,26 @@ def run_full_analysis(layer: int):
             log.info("  Best layer (%s): %d (mean steerability=%.6f)",
                      inj, best["layer"], best["mean_steerability"])
 
-    # Token set quality
-    output["token_set_quality"] = token_set_quality_report(layer)
-
     if not main_path.exists():
         log.error("Main sweep not found: %s", main_path)
         return output
 
     main_results = load_jsonl(main_path)
     log.info("Loaded %d main sweep results", len(main_results))
+    inferred_family = infer_token_family(main_results)
+    selected_family = canonical_token_family(token_family or inferred_family)
+    output["metadata"] = {
+        "layer": layer,
+        "token_family": selected_family,
+        "inferred_token_family": inferred_family,
+    }
 
     random_results = None
     if random_path.exists():
         random_results = load_jsonl(random_path)
         log.info("Loaded %d random sweep results", len(random_results))
+        random_family = infer_token_family(random_results)
+        output["metadata"]["random_token_family"] = random_family
 
     for injection in INJECTION_CONDITIONS:
         prefix = injection
@@ -816,6 +908,7 @@ def run_full_analysis(layer: int):
     # Prompt validation
     output["prompt_validation"] = validate_prompts(layer)
     output["baseline_token_diagnostics"] = baseline_token_diagnostics(layer)
+    output["token_set_quality"] = token_set_quality_report(layer, selected_family)
 
     # Steerability with entropy-breakdown points removed
     for injection in INJECTION_CONDITIONS:
@@ -838,7 +931,10 @@ def run_full_analysis(layer: int):
 
     # Print summary table
     print("\n" + "=" * 80)
-    print(f"LOGIT-SHIFT STEERING VALIDATION — LAYER {layer}")
+    print(
+        f"LOGIT-SHIFT STEERING VALIDATION — LAYER {layer} "
+        f"(token family: {selected_family})"
+    )
     print("=" * 80)
 
     for injection in INJECTION_CONDITIONS:
@@ -869,6 +965,7 @@ def main():
     parser.add_argument("--layer", type=int, help="Run full analysis at this layer")
     parser.add_argument("--layer-sweep", action="store_true", help="Analyze layer sweep only")
     parser.add_argument("--validate-prompts", action="store_true")
+    parser.add_argument("--token-family", type=str, default=TOKEN_SET_FAMILY_DEFAULT)
     args = parser.parse_args()
 
     if args.layer_sweep:
@@ -884,7 +981,7 @@ def main():
         print(json.dumps(result, indent=2, default=_json_convert))
 
     elif args.layer:
-        run_full_analysis(args.layer)
+        run_full_analysis(args.layer, token_family=args.token_family)
 
     else:
         parser.print_help()

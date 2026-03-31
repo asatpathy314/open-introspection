@@ -33,11 +33,51 @@ from config import (
     K_PRIMARY,
     K_VALUES,
     RESULTS_DIR,
+    TOKEN_SET_FAMILY_DEFAULT,
     VECTOR_DIR,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
+
+
+TOKEN_SET_FAMILY_ALIASES = {
+    "projection": "projection",
+    "proj": "projection",
+    "lexical_cosine": "lexical_cosine",
+    "lexical": "lexical_cosine",
+    "independent": "lexical_cosine",
+    "concept_piece_cosine": "concept_piece_cosine",
+    "cosine": "concept_piece_cosine",
+}
+
+
+def canonical_token_family(family: str | None) -> str:
+    raw = family or TOKEN_SET_FAMILY_DEFAULT
+    try:
+        return TOKEN_SET_FAMILY_ALIASES[raw]
+    except KeyError as e:
+        valid = ", ".join(sorted(set(TOKEN_SET_FAMILY_ALIASES.values())))
+        raise ValueError(f"Unknown token family '{raw}'. Valid options: {valid}") from e
+
+
+def _token_set_blob_for_family(data: dict, family: str) -> dict:
+    family = canonical_token_family(family)
+    if family == "projection":
+        return data["token_sets"]
+    if family == "lexical_cosine":
+        return data["token_sets_lexical_cosine"]
+    if family == "concept_piece_cosine":
+        return data["token_sets_cosine"]
+    raise ValueError(f"Unsupported token family: {family}")
+
+
+def _tokens_for_k(layer_blob, k: int) -> list[int]:
+    if not layer_blob:
+        return []
+    if isinstance(layer_blob, list):
+        return layer_blob[:k]
+    return layer_blob.get(str(k), [])
 
 
 def _ensure_dir():
@@ -636,17 +676,21 @@ def plot_entropy_steerability_correlation(main_results: list[dict], analysis: di
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def plot_cosine_token_propensity(layer: int) -> Path:
-    """Expected propensity under cosine vs projection token sets (linear approx).
+def plot_independent_token_propensity(
+    layer: int,
+    independent_family: str = "lexical_cosine",
+) -> Path:
+    """Expected propensity under an independent token family vs projection.
 
     Projection token sets are chosen by concept_vector @ W_U, so they are
     circular — those tokens are precisely where the vector has the largest
-    effect.  Cosine token sets use embedding-space similarity and are defined
-    independently of the injected vector.
+    effect. The comparison family is defined independently of the injected
+    vector and is only used for offline diagnostics.
 
     Linear approximation: Δlogit_i ≈ α·(v @ W_U[i]), so expected propensity
     under any token set T is mean(v @ W_U[T]) − mean(v @ W_U[T_baseline]).
     """
+    independent_family = canonical_token_family(independent_family)
     W_U = torch.load(RESULTS_DIR / "unembed.pt", map_location="cpu", weights_only=True).float()
 
     with open(RESULTS_DIR / "token_sets.json") as f:
@@ -655,12 +699,15 @@ def plot_cosine_token_propensity(layer: int) -> Path:
     layer_str = str(layer)
     baseline_tokens = ts_data["baseline_tokens"]
     W_baseline = W_U[baseline_tokens].mean(dim=0)
+    independent_blob = _token_set_blob_for_family(ts_data, independent_family)
 
-    proj_props, cos_props, overlaps, concepts_ok = [], [], [], []
+    proj_props, ind_props, overlaps, concepts_ok = [], [], [], []
     for concept in CONCEPT_WORDS:
-        proj_tokens = ts_data["token_sets"].get(concept, {}).get(layer_str, {}).get(str(K_PRIMARY), [])
-        cos_tokens = ts_data["token_sets_cosine"].get(concept, {}).get(layer_str, [])[:K_PRIMARY]
-        if not proj_tokens or not cos_tokens:
+        proj_layer_blob = ts_data["token_sets"].get(concept, {}).get(layer_str, {})
+        ind_layer_blob = independent_blob.get(concept, {}).get(layer_str, {})
+        proj_tokens = _tokens_for_k(proj_layer_blob, K_PRIMARY) if proj_layer_blob else []
+        ind_tokens = _tokens_for_k(ind_layer_blob, K_PRIMARY) if ind_layer_blob else []
+        if not proj_tokens or not ind_tokens:
             continue
 
         vec_path = VECTOR_DIR / f"{concept.lower().replace(' ', '_')}_all_layers.pt"
@@ -672,18 +719,19 @@ def plot_cosine_token_propensity(layer: int) -> Path:
             return float((v @ W_U[toks].T).mean() - (v @ W_baseline))
 
         proj_props.append(_prop(proj_tokens))
-        cos_props.append(_prop(cos_tokens))
-        overlaps.append(len(set(proj_tokens) & set(cos_tokens)) / K_PRIMARY)
+        ind_props.append(_prop(ind_tokens))
+        overlaps.append(len(set(proj_tokens) & set(ind_tokens)) / K_PRIMARY)
         concepts_ok.append(concept)
 
     x = np.array(proj_props)
-    y = np.array(cos_props)
+    y = np.array(ind_props)
     rho, p = stats.spearmanr(x, y)
     ratios = y / (np.abs(x) + 1e-12)
+    family_label = independent_family.replace("_", " ")
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-    # Left: scatter proj vs cosine expected propensity, coloured by overlap
+    # Left: scatter proj vs independent expected propensity, coloured by overlap
     ax = axes[0]
     sc = ax.scatter(x, y, c=overlaps, cmap="viridis", s=50, edgecolors="none", alpha=0.85)
     for i, c in enumerate(concepts_ok):
@@ -693,7 +741,7 @@ def plot_cosine_token_propensity(layer: int) -> Path:
     ax.axhline(0, color="gray", lw=0.5, ls="--")
     ax.axvline(0, color="gray", lw=0.5, ls="--")
     ax.set_xlabel("Proj token set: v @ W_U[T_proj]", fontsize=9)
-    ax.set_ylabel("Cosine token set: v @ W_U[T_cos]", fontsize=9)
+    ax.set_ylabel(f"{family_label}: v @ W_U[T_ind]", fontsize=9)
     ax.set_title(
         f"Layer {layer} — expected propensity\nSpearman ρ={rho:.3f}, p={p:.4f} "
         f"| same-sign: {sum(xi*yi>0 for xi,yi in zip(x,y))}/{len(x)}",
@@ -702,7 +750,7 @@ def plot_cosine_token_propensity(layer: int) -> Path:
     plt.colorbar(sc, ax=ax, label="Token set Jaccard overlap")
     ax.legend(fontsize=8)
 
-    # Right: cos/proj ratio sorted, coloured by abstract/concrete
+    # Right: ind/proj ratio sorted, coloured by abstract/concrete
     ax2 = axes[1]
     order = np.argsort(ratios)
     rc = [_concept_color(concepts_ok[i]) for i in order]
@@ -711,9 +759,9 @@ def plot_cosine_token_propensity(layer: int) -> Path:
     ax2.axvline(0.0, color="gray", lw=0.5)
     ax2.set_yticks(range(len(concepts_ok)))
     ax2.set_yticklabels([concepts_ok[i] for i in order], fontsize=6)
-    ax2.set_xlabel("cos / proj expected propensity", fontsize=9)
+    ax2.set_xlabel("ind / proj expected propensity", fontsize=9)
     ax2.set_title(
-        f"Signal retained in cosine tokens\nmedian ratio={float(np.median(ratios)):.3f}, "
+        f"Signal retained in {family_label}\nmedian ratio={float(np.median(ratios)):.3f}, "
         f"mean overlap={float(np.mean(overlaps)):.2f}",
         fontsize=9,
     )
@@ -723,10 +771,11 @@ def plot_cosine_token_propensity(layer: int) -> Path:
                         plt.Line2D([0], [0], color="k", ls="--", label="ratio=1")],
                fontsize=7)
 
-    fig.suptitle("Test 3: Cosine-independent token sets (linear approx, no new passes)",
+    fig.suptitle(
+        f"Test 3: {family_label} token sets (linear approx, no new passes)",
                  fontsize=11, y=1.01)
     fig.tight_layout()
-    return _save(fig, "cosine_token_propensity.png")
+    return _save(fig, f"{independent_family}_token_propensity.png")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -734,7 +783,7 @@ def plot_cosine_token_propensity(layer: int) -> Path:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def generate_all_plots(layer: int):
+def generate_all_plots(layer: int, token_family: str | None = None):
     """Generate all plots from analysis results."""
     from analysis import load_jsonl
 
@@ -745,6 +794,9 @@ def generate_all_plots(layer: int):
 
     with open(analysis_path) as f:
         analysis = json.load(f)
+    selected_family = canonical_token_family(
+        token_family or analysis.get("metadata", {}).get("token_family")
+    )
 
     main_path = RESULTS_DIR / f"main_sweep_layer{layer}.jsonl"
     main_results = load_jsonl(main_path) if main_path.exists() else []
@@ -805,7 +857,7 @@ def generate_all_plots(layer: int):
         path = plot_entropy_steerability_correlation(main_results, analysis)
         if path:
             generated_paths.append(path)
-    path = plot_cosine_token_propensity(layer)
+    path = plot_independent_token_propensity(layer, selected_family)
     if path:
         generated_paths.append(path)
 
@@ -829,8 +881,9 @@ def generate_all_plots(layer: int):
 def main():
     parser = argparse.ArgumentParser(description="Logit-Shift Plots")
     parser.add_argument("--layer", type=int, required=True)
+    parser.add_argument("--token-family", type=str, default=TOKEN_SET_FAMILY_DEFAULT)
     args = parser.parse_args()
-    generate_all_plots(args.layer)
+    generate_all_plots(args.layer, token_family=args.token_family)
 
 
 if __name__ == "__main__":
