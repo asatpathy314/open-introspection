@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import subprocess
 import sys
@@ -35,7 +36,7 @@ from pathlib import Path
 
 import nnsight
 import torch
-from inject import configure_ndif_api_key
+from dotenv import load_dotenv
 from prompt import (
     AFFIRMATIVE_RESPONSE_PROMPT,
     AFFIRMATIVE_WITH_IDENTIFICATION_PROMPT,
@@ -150,11 +151,12 @@ def generate_with_injection(
         model.model.layers[layer].output[0] = hs + intervention
         # Scale once onto device; reused for all autoregressive steps
         scaled = alpha * vec.to(device=hs.device, dtype=hs.dtype)
-        # Autoregressive decoding: inject on every new token
-        for _ in tracer.iter[:]:
+        output = tracer.result.save()
+        # Autoregressive decoding: inject on every new token (start at 1 to
+        # skip the prefill iteration already handled above)
+        for _ in tracer.iter[1:]:
             hs = model.model.layers[layer].output[0]  # (1, hidden)
             model.model.layers[layer].output[0] = hs + scaled
-        output = tracer.result.save()
     return output
 
 
@@ -304,8 +306,12 @@ def save_prompts(prompts_dir: Path, tokenizer) -> None:
     """
     (prompts_dir / "chat_template.txt").write_text(build_chat_prompt(tokenizer))
     (prompts_dir / "coherence_prompt.txt").write_text(COHERENCE_PROMPT)
-    (prompts_dir / "thinking_about_word_prompt.txt").write_text(THINKING_ABOUT_WORD_PROMPT)
-    (prompts_dir / "affirmative_response_prompt.txt").write_text(AFFIRMATIVE_RESPONSE_PROMPT)
+    (prompts_dir / "thinking_about_word_prompt.txt").write_text(
+        THINKING_ABOUT_WORD_PROMPT
+    )
+    (prompts_dir / "affirmative_response_prompt.txt").write_text(
+        AFFIRMATIVE_RESPONSE_PROMPT
+    )
     (prompts_dir / "affirmative_with_identification_prompt.txt").write_text(
         AFFIRMATIVE_WITH_IDENTIFICATION_PROMPT
     )
@@ -386,32 +392,41 @@ def run_injection_sweep(
                 concept = shuffled[i]
 
                 if (layer, alpha, concept) in completed_injection:
-                    print(f"[trial {trial_idx:04d}] SKIP layer={layer} alpha={alpha} concept={concept}")
+                    print(
+                        f"[trial {trial_idx:04d}] SKIP layer={layer} alpha={alpha} concept={concept}"
+                    )
                     trial_idx += 1
                     continue
 
                 vec = load_concept_vector(vector_dir, concept, layer)
-                print(f"[trial {trial_idx:04d}] layer={layer} alpha={alpha} concept={concept}")
+                print(
+                    f"[trial {trial_idx:04d}] layer={layer} alpha={alpha} concept={concept}"
+                )
 
                 output = generate_with_injection(
                     model, input_ids, vec, layer, alpha, inject_start_idx, run_config
                 )
-                response = tokenizer.decode(output[0][seq_len:], skip_special_tokens=True).strip()
+                response = tokenizer.decode(
+                    output[0][seq_len:], skip_special_tokens=True
+                ).strip()
 
-                append_record(trials_path, {
-                    "trial_idx": trial_idx,
-                    "layer_idx": layer,
-                    "alpha": alpha,
-                    "concept": concept,
-                    "shuffle_seed": seed,
-                    "inject_start_idx": inject_start_idx,
-                    "temperature": run_config.temperature,
-                    "do_sample": run_config.do_sample,
-                    "max_new_tokens": run_config.max_new_tokens,
-                    "prompt_token_count": seq_len,
-                    "response": response,
-                    "timestamp": datetime.now().isoformat(timespec="seconds"),
-                })
+                append_record(
+                    trials_path,
+                    {
+                        "trial_idx": trial_idx,
+                        "layer_idx": layer,
+                        "alpha": alpha,
+                        "concept": concept,
+                        "shuffle_seed": seed,
+                        "inject_start_idx": inject_start_idx,
+                        "temperature": run_config.temperature,
+                        "do_sample": run_config.do_sample,
+                        "max_new_tokens": run_config.max_new_tokens,
+                        "prompt_token_count": seq_len,
+                        "response": response,
+                        "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    },
+                )
                 trial_idx += 1
 
 
@@ -445,22 +460,27 @@ def run_control_sweep(
 
         print(f"[control {ctrl_idx:04d}]")
         output = generate_control(model, input_ids, run_config)
-        response = tokenizer.decode(output[0][seq_len:], skip_special_tokens=True).strip()
+        response = tokenizer.decode(
+            output[0][seq_len:], skip_special_tokens=True
+        ).strip()
 
-        append_record(trials_path, {
-            "trial_idx": ctrl_idx,
-            "layer_idx": None,
-            "alpha": 0,
-            "concept": None,
-            "shuffle_seed": None,
-            "inject_start_idx": inject_start_idx,
-            "temperature": run_config.temperature,
-            "do_sample": run_config.do_sample,
-            "max_new_tokens": run_config.max_new_tokens,
-            "prompt_token_count": seq_len,
-            "response": response,
-            "timestamp": datetime.now().isoformat(timespec="seconds"),
-        })
+        append_record(
+            trials_path,
+            {
+                "trial_idx": ctrl_idx,
+                "layer_idx": None,
+                "alpha": 0,
+                "concept": None,
+                "shuffle_seed": None,
+                "inject_start_idx": inject_start_idx,
+                "temperature": run_config.temperature,
+                "do_sample": run_config.do_sample,
+                "max_new_tokens": run_config.max_new_tokens,
+                "prompt_token_count": seq_len,
+                "response": response,
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+            },
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -528,12 +548,25 @@ def run_experiment(run_config: RunConfig, output_dir: Path | None = None) -> Pat
     print(f"Prompt: {seq_len} tokens, injection starts at token {inject_start_idx}")
 
     run_injection_sweep(
-        model, tokenizer, input_ids, seq_len, inject_start_idx,
-        run_config, Path(run_config.vector_dir), trials_path, completed_injection,
+        model,
+        tokenizer,
+        input_ids,
+        seq_len,
+        inject_start_idx,
+        run_config,
+        Path(run_config.vector_dir),
+        trials_path,
+        completed_injection,
     )
     run_control_sweep(
-        model, tokenizer, input_ids, seq_len, inject_start_idx,
-        run_config, trials_path, completed_control_idxs,
+        model,
+        tokenizer,
+        input_ids,
+        seq_len,
+        inject_start_idx,
+        run_config,
+        trials_path,
+        completed_control_idxs,
     )
 
     print(f"\nDone. Results in: {output_dir}")
@@ -565,7 +598,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    configure_ndif_api_key()
+    load_dotenv()
+    api_key = os.environ.get("NDIF_API_KEY")
+    if api_key:
+        nnsight.CONFIG.set_default_api_key(api_key)
 
     concepts = list_concepts(VECTOR_DIR)
 
