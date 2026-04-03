@@ -18,8 +18,8 @@ Key assumptions:
   - `uv` is on PATH (used to capture the package environment snapshot).
   - Vector files exist at VECTOR_DIR/<concept>_all_layers.pt.
   - RunConfig.concepts has at least n_repeats elements.
-  - generate_with_injection / generate_control are called from this __main__ module
-    to satisfy nnsight's source-code analysis constraint.
+  - All model.generate() context blocks must be defined in this file (not imported from
+    another module) to satisfy nnsight's source-code analysis constraint.
 """
 
 from __future__ import annotations
@@ -35,7 +35,6 @@ from pathlib import Path
 
 import nnsight
 import torch
-from generate import TrialConfig, generate_control, generate_with_injection
 from inject import configure_ndif_api_key
 from prompt import (
     AFFIRMATIVE_RESPONSE_PROMPT,
@@ -55,13 +54,18 @@ NUM_LAYERS = 80
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
 
 
+# ---------------------------------------------------------------------------
+# Dataclasses
+# ---------------------------------------------------------------------------
+
+
 @dataclass
 class RunConfig:
     """Top-level configuration for a full experiment sweep.
 
     Attributes:
         layers: Layer indices to sweep over.
-        alphas: Injection strengths to sweep over. Use 0.0 for control-only runs.
+        alphas: Injection strengths to sweep over.
         n_repeats: Injection trials per (layer, alpha) combo. Must be <= len(concepts).
         n_control_trials: Baseline (no-injection) trials appended after the sweep.
         concepts: Concept names available for injection.
@@ -89,10 +93,112 @@ class RunConfig:
     vector_dir: str = str(VECTOR_DIR)
 
 
+# ---------------------------------------------------------------------------
+# Generation functions
+#
+# IMPORTANT: These functions contain model.generate() context blocks and MUST
+# remain defined in this file. nnsight 0.6 uses source-code analysis to locate
+# trace contexts; if these were moved to a helper module, nnsight would fail to
+# find them and raise a RemoteException on the server side.
+# ---------------------------------------------------------------------------
+
+
+def generate_with_injection(
+    model: nnsight.LanguageModel,
+    input_ids: torch.Tensor,
+    vec: torch.Tensor,
+    layer: int,
+    alpha: float,
+    inject_start_idx: int,
+    run_config: RunConfig,
+) -> torch.Tensor:
+    """Generate text with a concept vector injected at a specific layer.
+
+    Purpose: During the prefill step, adds alpha * vec to all hidden states at
+    `layer` from `inject_start_idx` onward. During autoregressive decoding, adds
+    the same scaled vector at every new token position.
+
+    Assumptions:
+        - model is loaded and NDIF API key is configured.
+        - input_ids has shape [1, seq_len].
+        - vec has shape [hidden_dim] matching the model's hidden size.
+        - Must be defined in the __main__ module (nnsight source-analysis constraint).
+
+    Args:
+        model: The nnsight language model.
+        input_ids: Token IDs, shape [1, seq_len].
+        vec: Concept vector to inject, shape [hidden_dim].
+        layer: Layer index at which to inject.
+        alpha: Injection scale factor.
+        inject_start_idx: Token position from which prefill injection begins.
+        run_config: Provides max_new_tokens, do_sample, temperature, remote.
+
+    Returns:
+        torch.Tensor: Full generated token IDs (prompt + response).
+    """
+    with model.generate(
+        input_ids,
+        max_new_tokens=run_config.max_new_tokens,
+        do_sample=run_config.do_sample,
+        temperature=run_config.temperature,
+        remote=run_config.remote,
+    ) as tracer:
+        # Prefill: inject from inject_start_idx onward
+        hs = model.model.layers[layer].output[0]  # (seq_len, hidden)
+        intervention = torch.zeros_like(hs)
+        intervention[inject_start_idx:, :] = vec * alpha
+        model.model.layers[layer].output[0] = hs + intervention
+        # Scale once onto device; reused for all autoregressive steps
+        scaled = alpha * vec.to(device=hs.device, dtype=hs.dtype)
+        # Autoregressive decoding: inject on every new token
+        for _ in tracer.iter[:]:
+            hs = model.model.layers[layer].output[0]  # (1, hidden)
+            model.model.layers[layer].output[0] = hs + scaled
+        output = tracer.result.save()
+    return output
+
+
+def generate_control(
+    model: nnsight.LanguageModel,
+    input_ids: torch.Tensor,
+    run_config: RunConfig,
+) -> torch.Tensor:
+    """Generate text with no intervention (baseline / control trial).
+
+    Purpose: Produce a response to the trial prompt without any concept injection,
+    providing a baseline distribution against which injection trials are compared.
+
+    Assumptions:
+        - model is loaded and NDIF API key is configured.
+        - input_ids has shape [1, seq_len].
+        - Must be defined in the __main__ module (nnsight source-analysis constraint).
+
+    Args:
+        model: The nnsight language model.
+        input_ids: Token IDs, shape [1, seq_len].
+        run_config: Provides max_new_tokens, do_sample, temperature, remote.
+
+    Returns:
+        torch.Tensor: Full generated token IDs (prompt + response).
+    """
+    with model.generate(
+        input_ids,
+        max_new_tokens=run_config.max_new_tokens,
+        do_sample=run_config.do_sample,
+        temperature=run_config.temperature,
+        remote=run_config.remote,
+    ) as tracer:
+        output = tracer.result.save()
+    return output
+
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+
 def list_concepts(vector_dir: Path) -> list[str]:
     """Return sorted concept names found in vector_dir, excluding baseline_mean.
-
-    Purpose: Derive the concept list from filenames so no manual list is needed.
 
     Assumptions:
         - Each concept file is named <concept>_all_layers.pt.
@@ -198,12 +304,8 @@ def save_prompts(prompts_dir: Path, tokenizer) -> None:
     """
     (prompts_dir / "chat_template.txt").write_text(build_chat_prompt(tokenizer))
     (prompts_dir / "coherence_prompt.txt").write_text(COHERENCE_PROMPT)
-    (prompts_dir / "thinking_about_word_prompt.txt").write_text(
-        THINKING_ABOUT_WORD_PROMPT
-    )
-    (prompts_dir / "affirmative_response_prompt.txt").write_text(
-        AFFIRMATIVE_RESPONSE_PROMPT
-    )
+    (prompts_dir / "thinking_about_word_prompt.txt").write_text(THINKING_ABOUT_WORD_PROMPT)
+    (prompts_dir / "affirmative_response_prompt.txt").write_text(AFFIRMATIVE_RESPONSE_PROMPT)
     (prompts_dir / "affirmative_with_identification_prompt.txt").write_text(
         AFFIRMATIVE_WITH_IDENTIFICATION_PROMPT
     )
@@ -242,79 +344,36 @@ def append_record(path: Path, record: dict) -> None:
         f.write(json.dumps(record) + "\n")
 
 
-def run_experiment(run_config: RunConfig, output_dir: Path | None = None) -> Path:
-    """Execute the full experiment sweep and write results to an output folder.
+# ---------------------------------------------------------------------------
+# Sweeps
+# ---------------------------------------------------------------------------
 
-    Purpose: Orchestrate injection and control trials, persisting each result
-    immediately. If output_dir already contains a partial trials.jsonl, completed
-    trials are skipped so the sweep resumes from where it left off.
+
+def run_injection_sweep(
+    model: nnsight.LanguageModel,
+    tokenizer,
+    input_ids: torch.Tensor,
+    seq_len: int,
+    inject_start_idx: int,
+    run_config: RunConfig,
+    vector_dir: Path,
+    trials_path: Path,
+    completed_injection: set,
+) -> None:
+    """Run the full (layer, alpha, concept) injection sweep, skipping completed trials.
+
+    Purpose: Iterate over all (layer, alpha) combos, shuffle concepts per combo, and
+    run n_repeats injection trials each, writing each result to trials.jsonl immediately.
 
     Assumptions:
-        - configure_ndif_api_key() has been called before this function.
+        - model is loaded and NDIF API key is configured.
+        - completed_injection contains (layer_idx, alpha, concept) tuples to skip.
         - run_config.concepts has at least run_config.n_repeats elements.
-        - Must be called from the __main__ module (nnsight constraint).
-
-    Args:
-        run_config: Experiment configuration.
-        output_dir: If provided, resume into this existing directory. If None,
-            create a new timestamped directory under RESULTS_DIR.
-
-    Returns:
-        Path: The output directory used.
 
     Side effects:
-        - Creates output_dir and subdirectories (if new).
-        - Writes/appends to trials.jsonl.
-        - Writes run_config.json, environment.txt, prompts/*.txt (skipped if resuming
-          and files already exist).
-        - Makes NDIF network calls for each trial.
+        Appends injection trial records to trials_path.
+        Makes NDIF network calls for each non-skipped trial.
     """
-    resuming = output_dir is not None and output_dir.exists()
-    if output_dir is None:
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        output_dir = RESULTS_DIR / timestamp
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    trials_path = output_dir / "trials.jsonl"
-
-    # Crash recovery: load already-completed trials
-    completed_injection, completed_control_idxs = load_completed_trials(trials_path)
-    n_done = len(completed_injection) + len(completed_control_idxs)
-    if resuming and n_done > 0:
-        print(
-            f"Resuming into {output_dir} — "
-            f"skipping {len(completed_injection)} injection + "
-            f"{len(completed_control_idxs)} control trials already on disk."
-        )
-
-    # Load model + tokenizer
-    model = nnsight.LanguageModel(run_config.model_id)
-    tokenizer = model.tokenizer
-
-    # Build prompt (same for every trial)
-    _, input_ids = build_trial_prompt(tokenizer)
-    inject_start_idx = find_injection_start_idx(tokenizer, input_ids)
-    seq_len = input_ids.shape[1]
-
-    # Save prompts + environment + config (skipped on resume to preserve originals)
-    if not resuming:
-        prompts_dir = output_dir / "prompts"
-        prompts_dir.mkdir(exist_ok=True)
-        save_prompts(prompts_dir, tokenizer)
-
-        (output_dir / "environment.txt").write_text(capture_environment())
-
-        config_dict = asdict(run_config)
-        config_dict["timestamp"] = datetime.now().isoformat(timespec="seconds")
-        config_dict["python"] = sys.version
-        (output_dir / "run_config.json").write_text(json.dumps(config_dict, indent=2))
-
-    vector_dir = Path(run_config.vector_dir)
-
-    print(f"Output dir: {output_dir}")
-    print(f"Prompt: {seq_len} tokens, injection starts at token {inject_start_idx}")
-
-    # Injection sweep
     trial_idx = 0
     for layer in run_config.layers:
         for alpha in run_config.alphas:
@@ -325,35 +384,21 @@ def run_experiment(run_config: RunConfig, output_dir: Path | None = None) -> Pat
 
             for i in range(run_config.n_repeats):
                 concept = shuffled[i]
-                key = (layer, alpha, concept)
 
-                if key in completed_injection:
-                    print(
-                        f"[trial {trial_idx:04d}] SKIP layer={layer} alpha={alpha} concept={concept}"
-                    )
+                if (layer, alpha, concept) in completed_injection:
+                    print(f"[trial {trial_idx:04d}] SKIP layer={layer} alpha={alpha} concept={concept}")
                     trial_idx += 1
                     continue
 
                 vec = load_concept_vector(vector_dir, concept, layer)
-                trial_config = TrialConfig(
-                    layer_idx=layer,
-                    alpha=alpha,
-                    inject_start_idx=inject_start_idx,
-                    max_new_tokens=run_config.max_new_tokens,
-                    do_sample=run_config.do_sample,
-                    temperature=run_config.temperature,
-                    remote=run_config.remote,
-                )
+                print(f"[trial {trial_idx:04d}] layer={layer} alpha={alpha} concept={concept}")
 
-                print(
-                    f"[trial {trial_idx:04d}] layer={layer} alpha={alpha} concept={concept}"
+                output = generate_with_injection(
+                    model, input_ids, vec, layer, alpha, inject_start_idx, run_config
                 )
-                output = generate_with_injection(model, input_ids, vec, trial_config)
-                response = tokenizer.decode(
-                    output[0][seq_len:], skip_special_tokens=True
-                ).strip()
+                response = tokenizer.decode(output[0][seq_len:], skip_special_tokens=True).strip()
 
-                record = {
+                append_record(trials_path, {
                     "trial_idx": trial_idx,
                     "layer_idx": layer,
                     "alpha": alpha,
@@ -366,33 +411,43 @@ def run_experiment(run_config: RunConfig, output_dir: Path | None = None) -> Pat
                     "prompt_token_count": seq_len,
                     "response": response,
                     "timestamp": datetime.now().isoformat(timespec="seconds"),
-                }
-                append_record(trials_path, record)
+                })
                 trial_idx += 1
 
-    # --- Control sweep ---
-    ctrl_config = TrialConfig(
-        layer_idx=0,
-        alpha=0.0,
-        inject_start_idx=inject_start_idx,
-        max_new_tokens=run_config.max_new_tokens,
-        do_sample=run_config.do_sample,
-        temperature=run_config.temperature,
-        remote=run_config.remote,
-    )
 
+def run_control_sweep(
+    model: nnsight.LanguageModel,
+    tokenizer,
+    input_ids: torch.Tensor,
+    seq_len: int,
+    inject_start_idx: int,
+    run_config: RunConfig,
+    trials_path: Path,
+    completed_control_idxs: set,
+) -> None:
+    """Run n_control_trials baseline (no-injection) trials, skipping completed ones.
+
+    Purpose: Generate responses with no intervention as a baseline distribution,
+    writing each result to trials.jsonl immediately.
+
+    Assumptions:
+        - model is loaded and NDIF API key is configured.
+        - completed_control_idxs contains trial_idx ints to skip.
+
+    Side effects:
+        Appends control trial records to trials_path.
+        Makes NDIF network calls for each non-skipped trial.
+    """
     for ctrl_idx in range(run_config.n_control_trials):
         if ctrl_idx in completed_control_idxs:
             print(f"[control {ctrl_idx:04d}] SKIP")
             continue
 
         print(f"[control {ctrl_idx:04d}]")
-        output = generate_control(model, input_ids, ctrl_config)
-        response = tokenizer.decode(
-            output[0][seq_len:], skip_special_tokens=True
-        ).strip()
+        output = generate_control(model, input_ids, run_config)
+        response = tokenizer.decode(output[0][seq_len:], skip_special_tokens=True).strip()
 
-        record = {
+        append_record(trials_path, {
             "trial_idx": ctrl_idx,
             "layer_idx": None,
             "alpha": 0,
@@ -405,15 +460,93 @@ def run_experiment(run_config: RunConfig, output_dir: Path | None = None) -> Pat
             "prompt_token_count": seq_len,
             "response": response,
             "timestamp": datetime.now().isoformat(timespec="seconds"),
-        }
-        append_record(trials_path, record)
+        })
+
+
+# ---------------------------------------------------------------------------
+# Experiment orchestration
+# ---------------------------------------------------------------------------
+
+
+def run_experiment(run_config: RunConfig, output_dir: Path | None = None) -> Path:
+    """Set up the output directory and delegate to the injection and control sweeps.
+
+    Purpose: Handle directory creation, crash-recovery state loading, metadata
+    persistence, model loading, and prompt building — then hand off to the sweeps.
+
+    Assumptions:
+        - configure_ndif_api_key() has been called before this function.
+        - run_config.concepts has at least run_config.n_repeats elements.
+
+    Args:
+        run_config: Experiment configuration.
+        output_dir: If provided, resume into this existing directory. If None,
+            create a new timestamped directory under RESULTS_DIR.
+
+    Returns:
+        Path: The output directory used.
+
+    Side effects:
+        - Creates output_dir (if new).
+        - Writes run_config.json, environment.txt, prompts/*.txt (skipped on resume).
+        - Delegates NDIF calls and trials.jsonl writes to the sweep functions.
+    """
+    resuming = output_dir is not None and output_dir.exists()
+    if output_dir is None:
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        output_dir = RESULTS_DIR / timestamp
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    trials_path = output_dir / "trials.jsonl"
+
+    completed_injection, completed_control_idxs = load_completed_trials(trials_path)
+    if resuming and (completed_injection or completed_control_idxs):
+        print(
+            f"Resuming into {output_dir} — "
+            f"skipping {len(completed_injection)} injection + "
+            f"{len(completed_control_idxs)} control trials already on disk."
+        )
+
+    model = nnsight.LanguageModel(run_config.model_id)
+    tokenizer = model.tokenizer
+
+    _, input_ids = build_trial_prompt(tokenizer)
+    inject_start_idx = find_injection_start_idx(tokenizer, input_ids)
+    seq_len = input_ids.shape[1]
+
+    if not resuming:
+        prompts_dir = output_dir / "prompts"
+        prompts_dir.mkdir(exist_ok=True)
+        save_prompts(prompts_dir, tokenizer)
+        (output_dir / "environment.txt").write_text(capture_environment())
+        config_dict = asdict(run_config)
+        config_dict["timestamp"] = datetime.now().isoformat(timespec="seconds")
+        config_dict["python"] = sys.version
+        (output_dir / "run_config.json").write_text(json.dumps(config_dict, indent=2))
+
+    print(f"Output dir: {output_dir}")
+    print(f"Prompt: {seq_len} tokens, injection starts at token {inject_start_idx}")
+
+    run_injection_sweep(
+        model, tokenizer, input_ids, seq_len, inject_start_idx,
+        run_config, Path(run_config.vector_dir), trials_path, completed_injection,
+    )
+    run_control_sweep(
+        model, tokenizer, input_ids, seq_len, inject_start_idx,
+        run_config, trials_path, completed_control_idxs,
+    )
 
     print(f"\nDone. Results in: {output_dir}")
     return output_dir
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
 def main() -> None:
-    """Entry point: parse args, configure NDIF, build RunConfig, run experiment.
+    """Parse args, configure NDIF, build RunConfig, run experiment.
 
     Purpose: Hard-codes the default experimental parameters. Pass --resume <dir>
     to continue an interrupted run without re-running completed trials.
