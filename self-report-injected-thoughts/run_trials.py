@@ -151,12 +151,11 @@ def generate_with_injection(
         model.model.layers[layer].output[0] = hs + intervention
         # Scale once onto device; reused for all autoregressive steps
         scaled = alpha * vec.to(device=hs.device, dtype=hs.dtype)
-        output = tracer.result.save()
-        # Autoregressive decoding: inject on every new token (start at 1 to
-        # skip the prefill iteration already handled above)
-        for _ in tracer.iter[1:]:
+        # Autoregressive decoding: inject on every new token
+        for _ in tracer.iter[:]:
             hs = model.model.layers[layer].output[0]  # (1, hidden)
             model.model.layers[layer].output[0] = hs + scaled
+        output = tracer.result.save()
     return output
 
 
