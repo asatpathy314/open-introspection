@@ -47,9 +47,9 @@ from prompt import (
     find_injection_start_idx,
 )
 
-MODEL_ID = "meta-llama/Llama-3.3-70B-Instruct"
+MODEL_ID = "meta-llama/Llama-3.1-70B-Instruct"
 VECTOR_DIR = (
-    Path(__file__).resolve().parent.parent / "data/vectors/llama-3.3-70b-instruct"
+    Path(__file__).resolve().parent.parent / "data/vectors/llama-3.1-70b-instruct"
 )
 NUM_LAYERS = 80
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
@@ -138,24 +138,27 @@ def generate_with_injection(
         torch.Tensor: Full generated token IDs (prompt + response).
     """
     with model.generate(
-        input_ids,
         max_new_tokens=run_config.max_new_tokens,
         do_sample=run_config.do_sample,
         temperature=run_config.temperature,
         remote=run_config.remote,
     ) as tracer:
-        # Prefill: inject from inject_start_idx onward
-        hs = model.model.layers[layer].output[0]  # (seq_len, hidden)
-        intervention = torch.zeros_like(hs)
-        intervention[inject_start_idx:, :] = vec * alpha
-        model.model.layers[layer].output[0] = hs + intervention
-        # Scale once onto device; reused for all autoregressive steps
-        scaled = alpha * vec.to(device=hs.device, dtype=hs.dtype)
-        # Autoregressive decoding: inject on every new token
-        for _ in tracer.iter[:]:
-            hs = model.model.layers[layer].output[0]  # (1, hidden)
-            model.model.layers[layer].output[0] = hs + scaled
-        output = tracer.result.save()
+        with tracer.invoke(input_ids):
+            # Prefill: inject from inject_start_idx onward
+            hs = model.model.layers[layer].output[0]  # (seq_len, hidden)
+            intervention = torch.zeros_like(hs)
+            intervention[inject_start_idx:, :] = vec * alpha
+            model.model.layers[layer].output[0] = hs + intervention
+            scaled = alpha * vec.to(device=hs.device, dtype=hs.dtype)
+
+            for _ in tracer.iter[1:]:  # we use 1: to skip double injecting on prefill
+                hs = model.model.layers[layer].output[0]  # (1, hidden)
+                model.model.layers[layer].output[0] = hs + scaled
+
+        # The .save() is placed in a separate invoke block because statements
+        # appearing after `tracer.iter[:]` in the same block are sometimes not executed
+        with tracer.invoke():
+            output = tracer.result.save()
     return output
 
 
@@ -183,13 +186,13 @@ def generate_control(
         torch.Tensor: Full generated token IDs (prompt + response).
     """
     with model.generate(
-        input_ids,
         max_new_tokens=run_config.max_new_tokens,
         do_sample=run_config.do_sample,
         temperature=run_config.temperature,
         remote=run_config.remote,
     ) as tracer:
-        output = tracer.result.save()
+        with tracer.invoke(input_ids):
+            output = tracer.result.save()
     return output
 
 
