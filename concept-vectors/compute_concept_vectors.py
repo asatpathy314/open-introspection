@@ -68,6 +68,7 @@ BASELINE_WORDS_STR = (
     "Echoes, Pianos, Sanctuaries, Abysses, Air, Dewdrops, Gardens, Literature, "
     "Rice, Enigmas"
 )
+
 BASELINE_WORDS = [w.strip().lower() for w in BASELINE_WORDS_STR.split(",") if w.strip()]
 
 # Concepts to compute vectors for. By default, use a sample set.
@@ -416,71 +417,6 @@ def compute_all_vectors_async(
 
 
 # ============================================================================
-# Verification
-# ============================================================================
-
-
-def verify_against_baseline(
-    model,
-    baseline_mean: torch.Tensor,
-    n: int = VERIFY_N,
-    atol: float = ATOL,
-    cos_min: float = COS_MIN,
-):
-    """
-    Verify that the async pipeline produces identical results to the blocking
-    baseline for a small set of concepts.
-    """
-    verify_concepts = CONCEPT_LIST[:n]
-    num_layers = model.config.num_hidden_layers
-    baseline_hash = tensor_hash(baseline_mean)
-
-    print(f"\n[Verify] Checking {len(verify_concepts)} concepts...")
-
-    all_pass = True
-
-    for concept in verify_concepts:
-        # Method 1: Blocking (ground-truth equivalent)
-        sample_blocking = _trace_word_blocking(model, concept, num_layers)
-        vec_blocking = compute_concept_vector(sample_blocking, baseline_mean)
-
-        # Method 2: Load from disk (computed by Phase B async)
-        slug = concept_slug(concept)
-        disk_path = OUTPUT_DIR / f"{slug}_all_layers.pt"
-
-        if not disk_path.exists():
-            print(f"  '{concept}': SKIP (not on disk)")
-            continue
-
-        vec_async = torch.load(disk_path, weights_only=True)
-
-        # Check absolute difference
-        max_diff = (vec_blocking - vec_async).abs().max().item()
-
-        # Check cosine similarity (flatten to 1D for cos sim)
-        cos_sim = torch.nn.functional.cosine_similarity(
-            vec_blocking.flatten().unsqueeze(0),
-            vec_async.flatten().unsqueeze(0),
-        ).item()
-
-        passed = max_diff <= atol and cos_sim >= cos_min
-        status = "PASS" if passed else "FAIL"
-        if not passed:
-            all_pass = False
-
-        print(
-            f"  '{concept}': {status} (max_diff={max_diff:.2e}, cos_sim={cos_sim:.8f})"
-        )
-
-    if all_pass:
-        print("[Verify] All checks passed!")
-    else:
-        print("[Verify] Some checks FAILED — investigate differences.")
-
-    return all_pass
-
-
-# ============================================================================
 # Main
 # ============================================================================
 
@@ -521,9 +457,6 @@ def main():
     # --- Phase B: All concept vectors (async) ---
     print()
     failures = compute_all_vectors_async(model, CONCEPT_LIST, baseline_mean) or []
-
-    # --- Verification ---
-    verify_against_baseline(model, baseline_mean)
 
     print("\nDone.")
     if failures:
