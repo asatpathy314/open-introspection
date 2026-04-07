@@ -608,10 +608,10 @@ def main() -> None:
     concepts = list_concepts(VECTOR_DIR)
 
     run_config = RunConfig(
-        layers=[30, 40],
-        alphas=[2.0, 4.0],
-        n_repeats=2,
-        n_control_trials=2,
+        layers=[28, 30, 32],
+        alphas=[0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0],
+        n_repeats=15,
+        n_control_trials=50,
         concepts=concepts,
         concept_shuffle_seed=42,
         max_new_tokens=100,
