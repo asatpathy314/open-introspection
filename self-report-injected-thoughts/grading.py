@@ -10,6 +10,7 @@ Each output is passed through 4 rubrics.
 """
 
 import json
+import time
 from pathlib import Path
 
 import anthropic
@@ -72,6 +73,13 @@ def build_batch_requests(trials: list[dict], prompt_template: str) -> list[Reque
 
 
 def grade_trials(trials: list[dict]) -> list[dict]:
+    rubric_names = [
+        "coherence",
+        "thinking_about_word",
+        "affirmative_response",
+        "affirmative_with_identification",
+    ]
+
     prompt_templates = [
         prompt.COHERENCE_PROMPT,
         prompt.THINKING_ABOUT_WORD_PROMPT,
@@ -80,17 +88,40 @@ def grade_trials(trials: list[dict]) -> list[dict]:
     ]
 
     batches = []
-
     for prompt_template in prompt_templates:
         batch_requests = build_batch_requests(trials, prompt_template)
         batch = client.messages.batches.create(requests=batch_requests)
         batches.append(batch)
+        print(f"Created batch {batch.id}")
 
-    while True:
-        for batch in batches:
-            # TODO: check the status of each batch use the docs https://platform.claude.com/docs/en/build-with-claude/batch-processing
-            # while batches not finished, wait
-            pass
+    # Poll until all batches are done
+    pending = set(range(len(batches)))
+    time_start = time.time()
+    while pending:
+        time.sleep(5)
+        for i in list(pending):
+            batches[i] = client.messages.batches.retrieve(batches[i].id)
+            if batches[i].processing_status == "ended":
+                print(f"Batch {batches[i].id} ({rubric_names[i]}) ended")
+                pending.discard(i)
+        print(f"Pending: {len(pending)}")
+
+    print(f"All batches ended in {time.time() - time_start:.1f}s")
+
+    # Collect results
+    for i, rubric_name in enumerate(rubric_names):
+        for result in client.messages.batches.results(batches[i].id):
+            trial_idx = int(result.custom_id)
+            if result.result.type == "succeeded":
+                text = "".join(
+                    block.text for block in result.result.message.content
+                    if block.type == "text"
+                )
+                trials[trial_idx][f"{rubric_name}_raw"] = text
+                last_word = text.strip().split()[-1].strip(".,!?:;").upper()
+                trials[trial_idx][rubric_name] = last_word if last_word in ("YES", "NO") else None
+            else:
+                trials[trial_idx][rubric_name] = None
 
     return trials
 
