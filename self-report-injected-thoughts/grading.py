@@ -10,7 +10,6 @@ Each output is passed through 4 rubrics.
 """
 
 import json
-import time
 from pathlib import Path
 
 import anthropic
@@ -25,8 +24,18 @@ client = anthropic.Anthropic()  # uses ANTHROPIC_API_KEY implicitly
 
 
 def load_trials(experiment_dirs: list[Path]) -> list[dict]:
-    # TODO: for each dir load the trials from the `trials.jsonl` file
-    raise NotImplementedError()
+    trials = []
+    for d in experiment_dirs:
+        trials_path = d / "trials.jsonl"
+        with trials_path.open() as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                record["experiment_dir"] = str(d)
+                trials.append(record)
+    return trials
 
 
 def build_batch_requests(trials: list[dict], prompt_template: str) -> list[Request]:
@@ -35,6 +44,10 @@ def build_batch_requests(trials: list[dict], prompt_template: str) -> list[Reque
 
     We set temperature to 0 to ensure deterministic output.
     """
+    question = "\n\n".join(
+        f"Human: {m['content']}" if m["role"] == "user" else f"Assistant: {m['content']}"
+        for m in prompt.EXPERIMENT_MESSAGES
+    )
     return [
         {
             "custom_id": str(idx),
@@ -44,7 +57,9 @@ def build_batch_requests(trials: list[dict], prompt_template: str) -> list[Reque
                 "messages": [
                     {
                         "content": prompt_template.format(
-                            question=t["question"], response=t["response"]
+                            question=question,
+                            response=t["response"],
+                            word=t.get("concept", ""),
                         ),
                         "role": "user",
                     }
