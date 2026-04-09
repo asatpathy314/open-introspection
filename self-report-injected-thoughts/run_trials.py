@@ -67,7 +67,8 @@ class RunConfig:
     Attributes:
         layers: Layer indices to sweep over.
         alphas: Injection strengths to sweep over.
-        n_repeats: Injection trials per (layer, alpha) combo. Must be <= len(concepts).
+        n_concepts: Unique concepts per (layer, alpha) combo. Must be <= len(concepts).
+        n_repeats: Times to repeat each concept per (layer, alpha) combo.
         n_control_trials: Baseline (no-injection) trials appended after the sweep.
         concepts: Concept names available for injection.
         concept_shuffle_seed: Base seed; per-combo seed is derived via
@@ -82,6 +83,7 @@ class RunConfig:
 
     layers: list[int]
     alphas: list[float]
+    n_concepts: int
     n_repeats: int
     n_control_trials: int
     concepts: list[str]
@@ -288,7 +290,8 @@ def load_completed_trials(trials_path: Path) -> tuple[set, set]:
                 completed_control_idxs.add(record["trial_idx"])
             else:
                 completed_injection.add(
-                    (record["layer_idx"], record["alpha"], record["concept"])
+                    (record["layer_idx"], record["alpha"], record["concept"],
+                     record.get("repeat_idx", 0))
                 )
 
     return completed_injection, completed_control_idxs
@@ -375,8 +378,8 @@ def run_injection_sweep(
 
     Assumptions:
         - model is loaded and NDIF API key is configured.
-        - completed_injection contains (layer_idx, alpha, concept) tuples to skip.
-        - run_config.concepts has at least run_config.n_repeats elements.
+        - completed_injection contains (layer_idx, alpha, concept, repeat_idx) tuples to skip.
+        - run_config.concepts has at least run_config.n_concepts elements.
 
     Side effects:
         Appends injection trial records to trials_path.
@@ -390,46 +393,48 @@ def run_injection_sweep(
             shuffled = list(run_config.concepts)
             rng.shuffle(shuffled)
 
-            for i in range(run_config.n_repeats):
+            for i in range(run_config.n_concepts):
                 concept = shuffled[i]
+                vec = load_concept_vector(vector_dir, concept, layer)
 
-                if (layer, alpha, concept) in completed_injection:
+                for rep in range(run_config.n_repeats):
+                    if (layer, alpha, concept, rep) in completed_injection:
+                        print(
+                            f"[trial {trial_idx:04d}] SKIP layer={layer} alpha={alpha} concept={concept} rep={rep}"
+                        )
+                        trial_idx += 1
+                        continue
+
                     print(
-                        f"[trial {trial_idx:04d}] SKIP layer={layer} alpha={alpha} concept={concept}"
+                        f"[trial {trial_idx:04d}] layer={layer} alpha={alpha} concept={concept} rep={rep}"
+                    )
+
+                    output = generate_with_injection(
+                        model, input_ids, vec, layer, alpha, inject_start_idx, run_config
+                    )
+                    response = tokenizer.decode(
+                        output[0][seq_len:], skip_special_tokens=True
+                    ).strip()
+
+                    append_record(
+                        trials_path,
+                        {
+                            "trial_idx": trial_idx,
+                            "layer_idx": layer,
+                            "alpha": alpha,
+                            "concept": concept,
+                            "repeat_idx": rep,
+                            "shuffle_seed": seed,
+                            "inject_start_idx": inject_start_idx,
+                            "temperature": run_config.temperature,
+                            "do_sample": run_config.do_sample,
+                            "max_new_tokens": run_config.max_new_tokens,
+                            "prompt_token_count": seq_len,
+                            "response": response,
+                            "timestamp": datetime.now().isoformat(timespec="seconds"),
+                        },
                     )
                     trial_idx += 1
-                    continue
-
-                vec = load_concept_vector(vector_dir, concept, layer)
-                print(
-                    f"[trial {trial_idx:04d}] layer={layer} alpha={alpha} concept={concept}"
-                )
-
-                output = generate_with_injection(
-                    model, input_ids, vec, layer, alpha, inject_start_idx, run_config
-                )
-                response = tokenizer.decode(
-                    output[0][seq_len:], skip_special_tokens=True
-                ).strip()
-
-                append_record(
-                    trials_path,
-                    {
-                        "trial_idx": trial_idx,
-                        "layer_idx": layer,
-                        "alpha": alpha,
-                        "concept": concept,
-                        "shuffle_seed": seed,
-                        "inject_start_idx": inject_start_idx,
-                        "temperature": run_config.temperature,
-                        "do_sample": run_config.do_sample,
-                        "max_new_tokens": run_config.max_new_tokens,
-                        "prompt_token_count": seq_len,
-                        "response": response,
-                        "timestamp": datetime.now().isoformat(timespec="seconds"),
-                    },
-                )
-                trial_idx += 1
 
 
 def run_control_sweep(
@@ -498,7 +503,7 @@ def run_experiment(run_config: RunConfig, output_dir: Path | None = None) -> Pat
 
     Assumptions:
         - configure_ndif_api_key() has been called before this function.
-        - run_config.concepts has at least run_config.n_repeats elements.
+        - run_config.concepts has at least run_config.n_concepts elements.
 
     Args:
         run_config: Experiment configuration.
@@ -608,9 +613,10 @@ def main() -> None:
     concepts = list_concepts(VECTOR_DIR)
 
     run_config = RunConfig(
-        layers=[28, 30, 32],
-        alphas=[0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0],
-        n_repeats=15,
+        layers=[40],
+        alphas=[2.0, 4.0],
+        n_concepts=50,
+        n_repeats=3,
         n_control_trials=50,
         concepts=concepts,
         concept_shuffle_seed=42,
