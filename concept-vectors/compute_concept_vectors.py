@@ -51,38 +51,20 @@ ATOL = float(os.environ.get("ATOL", "1e-3"))
 COS_MIN = float(os.environ.get("COS_MIN", "0.9999"))
 VERIFY_N = int(os.environ.get("VERIFY_N", "5"))
 
-# Lindsey et al. baseline words (100 words, as in the ground-truth code)
-BASELINE_WORDS_STR = (
-    "Desks, Jackets, Gondolas, Laughter, Intelligence, Bicycles, Chairs, "
-    "Orchestras, Sand, Pottery, Arrowheads, Jewelry, Daffodils, Plateaus, "
-    "Estuaries, Quilts, Moments, Bamboo, Ravines, Archives, Hieroglyphs, "
-    "Stars, Clay, Fossils, Wildlife, Flour, Traffic, Bubbles, Honey, Geodes, "
-    "Magnets, Ribbons, Zigzags, Puzzles, Tornadoes, Anthills, Galaxies, "
-    "Poverty, Diamonds, Universes, Vinegar, Nebulae, Knowledge, Marble, Fog, "
-    "Rivers, Scrolls, Silhouettes, Marbles, Cakes, Valleys, Whispers, "
-    "Pendulums, Towers, Tables, Glaciers, Whirlpools, Jungles, Wool, Anger, "
-    "Ramparts, Flowers, Research, Hammers, Clouds, Justice, Dogs, Butterflies, "
-    "Needles, Fortresses, Bonfires, Skyscrapers, Caravans, Patience, Bacon, "
-    "Velocities, Smoke, Electricity, Sunsets, Anchors, Parchments, Courage, "
-    "Statues, Oxygen, Time, Butterflies, Fabric, Pasta, Snowflakes, Mountains, "
-    "Echoes, Pianos, Sanctuaries, Abysses, Air, Dewdrops, Gardens, Literature, "
-    "Rice, Enigmas"
-)
+# Stimuli are stored as plain text files in data/stimuli/ (repo root) so they
+# can be edited or swapped without touching code. baseline_words.txt and
+# concepts.txt are comma-separated; sentences.txt is one sentence per line.
+STIMULI_DIR = Path(__file__).resolve().parent.parent / "data" / "stimuli"
 
-BASELINE_WORDS = [w.strip().lower() for w in BASELINE_WORDS_STR.split(",") if w.strip()]
 
-# Concepts to compute vectors for. By default, use a sample set.
-# The ground truth code demonstrates with "Dust"; extend as needed.
-CONCEPTS = (
-    "Dust, Satellites, Trumpets, Origami, Illusions, Cameras, Lightning, "
-    "Constellations, Treasures, Phones, Trees, Avalanches, Mirrors, Fountains, "
-    "Quarries, Sadness, Xylophones, Secrecy, Oceans, Information, Deserts, "
-    "Kaleidoscopes, Sugar, Vegetables, Poetry, Aquariums, Bags, Peace, Caverns, "
-    "Memories, Frosts, Volcanoes, Boulders, Harmonies, Masquerades, Rubber, Plastic, "
-    "Blood, Amphitheaters, Contraptions, Youths, Dynasties, Snow, Dirigibles, Algorithms, "
-    "Denim, Monoliths, Milk, Bread, Silver"
-)
-CONCEPT_LIST = [w.strip().lower() for w in CONCEPTS.split(",") if w.strip()]
+def _load_csv_stimuli(filename: str) -> List[str]:
+    """Load a comma-separated stimulus file from STIMULI_DIR, lowercased."""
+    text = (STIMULI_DIR / filename).read_text()
+    return [w.strip().lower() for w in text.split(",") if w.strip()]
+
+
+BASELINE_WORDS = _load_csv_stimuli("baseline_words.txt")
+CONCEPT_LIST = _load_csv_stimuli("concepts.txt")
 _THREAD_LOCAL = threading.local()
 
 # ============================================================================

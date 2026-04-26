@@ -77,78 +77,22 @@ MAX_RETRIES = 3
 RETRY_DELAY = 30  # seconds
 
 # ---------------------------------------------------------------------------
-# Concept word pool (same 50 words used in the original paper's protocol)
+# Stimuli (loaded from data/stimuli/ in the repo root)
 # ---------------------------------------------------------------------------
 
-CONCEPTS = (
-    "Dust, Satellites, Trumpets, Origami, Illusions, Cameras, Lightning, "
-    "Constellations, Treasures, Phones, Trees, Avalanches, Mirrors, Fountains, "
-    "Quarries, Sadness, Xylophones, Secrecy, Oceans, Information, Deserts, "
-    "Kaleidoscopes, Sugar, Vegetables, Poetry, Aquariums, Bags, Peace, Caverns, "
-    "Memories, Frosts, Volcanoes, Boulders, Harmonies, Masquerades, Rubber, Plastic, "
-    "Blood, Amphitheaters, Contraptions, Youths, Dynasties, Snow, Dirigibles, Algorithms, "
-    "Denim, Monoliths, Milk, Bread, Silver"
-)
-CONCEPT_LIST = [w.strip().lower() for w in CONCEPTS.split(",") if w.strip()]
+STIMULI_DIR = Path(__file__).resolve().parent.parent / "data" / "stimuli"
 
-# ---------------------------------------------------------------------------
-# Sentences used as stimuli
-# ---------------------------------------------------------------------------
+CONCEPT_LIST = [
+    w.strip().lower()
+    for w in (STIMULI_DIR / "concepts.txt").read_text().split(",")
+    if w.strip()
+]
 
-SENTENCES = """
-The old clock on the wall ticked loudly.
-She collected seashells every summer at the beach.
-The cat jumped onto the windowsill to watch birds.
-His favorite ice cream flavor was mint chocolate chip.
-The book fell open to page 217.
-Lightning flashed across the night sky.
-They planted tulip bulbs in the garden last fall.
-The coffee shop was bustling with morning customers.
-She tied her hiking boots with double knots.
-The museum exhibit featured ancient Egyptian artifacts.
-Children laughed as they ran through the sprinkler.
-The train arrived precisely on schedule.
-He couldn't remember where he had parked his car.
-Autumn leaves crunched beneath their feet.
-The recipe called for two teaspoons of vanilla extract.
-The dog wagged its tail excitedly at the park.
-Mountains loomed in the distance, covered with snow.
-She practiced piano for three hours every day.
-The telescope revealed stunning details of Saturn's rings.
-Fresh bread was baking in the oven.
-They watched the sunset from the rooftop.
-The professor explained the theory with great enthusiasm.
-Waves crashed against the rocky shoreline.
-He assembled the furniture without reading the instructions.
-Stars twinkled brightly in the clear night sky.
-The old photograph brought back forgotten memories.
-Bees buzzed around the flowering cherry tree.
-She solved the crossword puzzle in record time.
-The air conditioner hummed quietly in the background.
-Rain pattered softly against the windowpane.
-The movie theater was packed for the premiere.
-He sketched the landscape with charcoal pencils.
-Children built sandcastles at the water's edge.
-The orchestra tuned their instruments before the concert.
-Fragrant lilacs bloomed along the garden fence.
-The basketball bounced off the rim.
-She wrapped the birthday present with blue ribbon.
-The hiker followed the trail markers through the forest.
-Their canoe glided silently across the still lake.
-The antique vase was carefully wrapped in bubble wrap.
-Fireflies flickered in the summer twilight.
-The chef garnished the plate with fresh herbs.
-Wind chimes tinkled melodically on the porch.
-The flight attendant demonstrated safety procedures.
-He repaired the leaky faucet with a new washer.
-Fog shrouded the valley below the mountain.
-The comedian's joke made everyone laugh.
-She planted herbs in pots on the kitchen windowsill.
-The painting hung crookedly on the wall.
-Snowflakes drifted lazily from the gray sky.
-"""
-
-SENTENCE_LIST = [s.strip() for s in SENTENCES.split("\n") if s.strip()]
+SENTENCE_LIST = [
+    s.strip()
+    for s in (STIMULI_DIR / "sentences.txt").read_text().splitlines()
+    if s.strip()
+]
 
 # ---------------------------------------------------------------------------
 # Prompt / conversation construction
