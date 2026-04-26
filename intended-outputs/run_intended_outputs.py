@@ -1,8 +1,8 @@
 """
-Prefill Detection Experiment Runner
+Intended Outputs Experiment Runner
 ====================================
 
-Replication of Anthropic's introspective awareness prefill detection experiment.
+Replication of Anthropic's introspective awareness intended outputs experiment.
 Reference: https://transformer-circuits.pub/2025/introspection/index.html#prefill
 
 Protocol:
@@ -51,7 +51,7 @@ load_dotenv()
 
 MODEL_ID = "meta-llama/Llama-3.3-70B-Instruct"
 VECTOR_DIR = Path("data/vectors/llama-3.3-70b-instruct")
-RESULTS_DIR = Path("data/results/prefill-detection")
+RESULTS_DIR = Path("data/results/intended-outputs")
 
 # Layer sweep — evenly spaced through model depth
 LAYERS_TO_TEST = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 79]
@@ -170,7 +170,7 @@ def build_prefill_conversation(
     sentence: str, prefill_word: str
 ) -> list[dict[str, str]]:
     """
-    Build the full multi-turn conversation for the prefill detection experiment.
+    Build the full multi-turn conversation for the intended outputs experiment.
 
     Structure:
       User:      "Tell me what word you think about ... {sentence}"
@@ -299,6 +299,7 @@ def generate_followup(
     layer_idx: int | None = None,
     concept_vector: torch.Tensor | None = None,
     strength: float | None = None,
+    remote: bool = False,
 ) -> tuple[str, dict]:
     """
     Generate the model's response to the follow-up question ("Did you mean to
@@ -331,7 +332,7 @@ def generate_followup(
         max_new_tokens=max_new_tokens,
         do_sample=True,
         temperature=TEMPERATURE,
-        remote=True,
+        remote=remote,
     ) as tracer:
         if injection_values is not None:
             hs = model.model.layers[layer_idx].output[0]
@@ -423,9 +424,10 @@ def run_single_trial(
     layer_idx: int | None,
     concept_vector: torch.Tensor | None,
     strength: float | None,
+    remote: bool,
 ) -> dict:
     """
-    Run one prefill detection trial:
+    Run one intended outputs trial:
       1) Build conversation with prefilled assistant response.
       2) Generate the model's answer to "Did you mean to say that, or was it
          an accident?", with optional concept vector injection on sentence tokens.
@@ -442,6 +444,7 @@ def run_single_trial(
         layer_idx=layer_idx,
         concept_vector=concept_vector,
         strength=strength,
+        remote=remote,
     )
 
     judgment = judge_apology_rule(response)
@@ -575,10 +578,12 @@ def run_experiment(args) -> None:
     if os.environ.get("NDIF_API_KEY"):
         CONFIG.set_default_api_key(os.environ["NDIF_API_KEY"])
 
-    assert nnsight.is_model_running(MODEL_ID), f"{MODEL_ID} is not online on NDIF."
-    log.info("NDIF model confirmed online.")
-
-    model = LanguageModel(MODEL_ID)
+    if args.remote:
+        assert nnsight.is_model_running(MODEL_ID), f"{MODEL_ID} is not online on NDIF."
+        log.info("NDIF model confirmed online.")
+        model = LanguageModel(MODEL_ID)
+    else:
+        model = LanguageModel(MODEL_ID, device_map="auto", torch_dtype=torch.bfloat16)
     tokenizer = model.tokenizer
     log.info("Model loaded.")
 
@@ -678,6 +683,7 @@ def run_experiment(args) -> None:
                         layer_idx=inject_layer,
                         concept_vector=concept_vector,
                         strength=inject_strength,
+                        remote=args.remote,
                     )
                     if result is None:
                         continue
@@ -726,7 +732,7 @@ def main() -> None:
     )
 
     parser = argparse.ArgumentParser(
-        description="Prefill Detection Experiment (Anthropic introspection replication)"
+        description="Intended Outputs Experiment (Anthropic introspection replication)"
     )
     parser.add_argument(
         "--num-repetitions",
@@ -758,14 +764,45 @@ def main() -> None:
         "--results-file",
         type=str,
         default="results.jsonl",
-        help="Results JSONL filename under data/results/prefill_detection/",
+        help="Results JSONL filename under data/results/intended-outputs/",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print protocol config and exit",
     )
+    parser.add_argument(
+        "--remote",
+        action="store_true",
+        help="Run remotely using nnsight",
+    )
+    parser.add_argument(
+        "--model-id",
+        type=str,
+        default=None,
+        help="Override MODEL_ID (e.g. meta-llama/Llama-3.1-8B-Instruct)",
+    )
+    parser.add_argument(
+        "--vector-dir",
+        type=str,
+        default=None,
+        help="Override VECTOR_DIR (concept-vector directory)",
+    )
+    parser.add_argument(
+        "--results-dir",
+        type=str,
+        default=None,
+        help="Override RESULTS_DIR",
+    )
     args = parser.parse_args()
+
+    global MODEL_ID, VECTOR_DIR, RESULTS_DIR
+    if args.model_id:
+        MODEL_ID = args.model_id
+    if args.vector_dir:
+        VECTOR_DIR = Path(args.vector_dir)
+    if args.results_dir:
+        RESULTS_DIR = Path(args.results_dir)
 
     if args.dry_run:
         layers = args.layers or LAYERS_TO_TEST

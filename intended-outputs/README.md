@@ -1,6 +1,6 @@
 # Distinguishing Intended from Unintended Outputs via Introspection
 
-This document describes the methodology used in Anthropic's "Emergent Introspective Awareness" paper for their prefill detection experiment, as best as I can surmise from the paper.
+This document describes the methodology used in Anthropic's "Emergent Introspective Awareness" paper for their intended outputs experiment, as best as I can surmise from the paper.
 
 ## Goal
 
@@ -19,7 +19,7 @@ For the entire experiment, concept vectors are extracted using the following pro
 
 ## Experimental Setup
 
-### Prefill Detection
+### Intended Outputs
 
 1. Set up a conversation with a prefilled assistant response:
 

@@ -603,12 +603,19 @@ def main() -> None:
         default=None,
         help="Resume an existing run by passing its output directory.",
     )
+    parser.add_argument(
+        "--local",
+        action="store_true",
+        help="Run inference locally instead of through NDIF (default: remote).",
+    )
     args = parser.parse_args()
 
-    load_dotenv()
-    api_key = os.environ.get("NDIF_API_KEY")
-    if api_key:
-        nnsight.CONFIG.set_default_api_key(api_key)
+    remote = not args.local
+    if remote:
+        load_dotenv()
+        api_key = os.environ.get("NDIF_API_KEY")
+        if api_key:
+            nnsight.CONFIG.set_default_api_key(api_key)
 
     concepts = list_concepts(VECTOR_DIR)
 
@@ -623,7 +630,7 @@ def main() -> None:
         max_new_tokens=100,
         temperature=1.0,
         do_sample=True,
-        remote=True,
+        remote=remote,
     )
 
     run_experiment(run_config, output_dir=args.resume)

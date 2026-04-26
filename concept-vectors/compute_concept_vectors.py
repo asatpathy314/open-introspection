@@ -158,19 +158,6 @@ def atomic_save(obj, path: Path):
         raise
 
 
-def extract_activations_from_cache(cache, num_layers: int) -> torch.Tensor:
-    """
-    Extract last-token activations from all layers:
-        cache[f'model.model.layers.{i}']["output"][0, -1, :]
-    Returns: tensor of shape [num_layers, hidden_dim]
-    """
-    return torch.stack(
-        [
-            cache[f"model.model.layers.{i}"]["output"][0, -1, :]
-            for i in range(num_layers)
-        ],
-        dim=0,
-    )
 
 
 def poll_backend(
@@ -281,11 +268,23 @@ def load_baseline(path: Optional[Path] = None) -> torch.Tensor:
 
 
 def _trace_word_blocking(model, word: str, num_layers: int) -> torch.Tensor:
-    """Run a single blocking trace for a word. Returns [num_layers, hidden]."""
+    """Run a single blocking trace for a word. Returns [num_layers, hidden].
+
+    Stacks the last-token activations across all layers inside the trace and
+    saves the resulting tensor. We avoid `for layer in model.model.layers` and
+    `tracer.cache(...)` because both trigger a RecursionError on the
+    Envoy-wrapped ModuleList in current nnsight (see CLAUDE.md).
+    """
     prompt = make_prompt(model, word)
-    with model.trace(prompt, remote=True) as tracer:
-        cache = tracer.cache(modules=[layer for layer in model.model.layers]).save()
-    return extract_activations_from_cache(cache, num_layers)
+    with model.trace(prompt, remote=True):
+        stacked = torch.stack(
+            [
+                model.model.layers[i].output[0][-1, :].cpu()
+                for i in range(num_layers)
+            ],
+            dim=0,
+        ).save()
+    return stacked.detach()
 
 
 def compute_concept_vector(

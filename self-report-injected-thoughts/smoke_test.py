@@ -1,29 +1,44 @@
-"""Quick smoke test: 1 control + 1 injection trial via NDIF."""
+"""Quick smoke test: 1 control + 1 injection trial.
 
+Pass --local to run inference locally instead of through NDIF.
+"""
+
+import argparse
 import os
-import sys
 import torch
 from dotenv import load_dotenv
 
-load_dotenv()
-
-from prompt import build_trial_prompt
+from prompt import build_trial_prompt, find_injection_start_idx
 from run_trials import load_concept_vector, MODEL_ID, VECTOR_DIR
 
 # --- Setup ---
 import nnsight
 from nnsight import CONFIG, LanguageModel
 
-if os.environ.get("NDIF_API_KEY"):
-    CONFIG.set_default_api_key(os.environ["NDIF_API_KEY"])
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument(
+    "--local",
+    action="store_true",
+    help="Run inference locally instead of through NDIF (default: remote).",
+)
+args = parser.parse_args()
+REMOTE = not args.local
+
+if REMOTE:
+    load_dotenv()
+    if os.environ.get("NDIF_API_KEY"):
+        CONFIG.set_default_api_key(os.environ["NDIF_API_KEY"])
 
 print(f"Model: {MODEL_ID}")
-print(f"Online: {nnsight.is_model_running(MODEL_ID)}")
+print(f"Mode: {'remote (NDIF)' if REMOTE else 'local'}")
+if REMOTE:
+    print(f"Online: {nnsight.is_model_running(MODEL_ID)}")
 
 model = LanguageModel(MODEL_ID)
 tokenizer = model.tokenizer
 
-prompt, input_ids, injection_start_idx = build_trial_prompt(tokenizer)
+prompt, input_ids = build_trial_prompt(tokenizer)
+injection_start_idx = find_injection_start_idx(tokenizer, input_ids)
 seq_len = input_ids.shape[1]
 print(f"Prompt: {seq_len} tokens, injection starts at token {injection_start_idx}")
 
@@ -41,7 +56,7 @@ with model.generate(
     max_new_tokens=100,
     do_sample=True,
     temperature=1.0,
-    remote=True,
+    remote=REMOTE,
 ) as tracer:
     output_ctrl = tracer.result.save()
 
@@ -57,7 +72,7 @@ with model.generate(
     max_new_tokens=100,
     do_sample=True,
     temperature=1.0,
-    remote=True,
+    remote=REMOTE,
 ) as tracer:
     hs = model.model.layers[LAYER].output[0]
     scaled = ALPHA * vec.to(device=hs.device, dtype=hs.dtype)

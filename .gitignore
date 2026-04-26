@@ -5,6 +5,10 @@ data/results/**
 !data/results/README.md
 data/logs/
 
+# Slurm job output
+*.out
+*.err
+
 # Environment
 .env
 

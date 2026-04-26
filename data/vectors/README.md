@@ -106,7 +106,7 @@ This is used for reproducibility/integrity checks.
 
 ## Consumer expectations
 
-`prefill-detection/run_prefill_detection.py` loads vectors from:
+`intended-outputs/run_intended_outputs.py` loads vectors from:
 
 ```text
 <vector_dir>/<concept_slug>_all_layers.pt

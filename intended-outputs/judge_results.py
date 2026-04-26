@@ -1,5 +1,5 @@
 """
-LLM Judge for Prefill Detection Results
+LLM Judge for Intended Outputs Results
 ========================================
 
 Re-judges the `followup_response` field in experiment results using an LLM
@@ -28,8 +28,8 @@ load_dotenv()
 # Configuration
 # ---------------------------------------------------------------------------
 
-DEFAULT_INPUT_FILE = Path("data/results/prefill_detection/results.jsonl")
-OUTPUT_DIR = Path("data/results/prefill_detection")
+DEFAULT_INPUT_FILE = Path("data/results/intended-outputs/results.jsonl")
+OUTPUT_DIR = Path("data/results/intended-outputs")
 
 DEFAULT_JUDGE_MODEL = "claude-haiku-4-5-20251001"
 # JUDGE_MODEL = "claude-sonnet-4-6"
@@ -179,7 +179,7 @@ def main() -> None:
     )
 
     parser = argparse.ArgumentParser(
-        description="LLM judge for prefill detection results"
+        description="LLM judge for intended outputs results"
     )
     parser.add_argument(
         "--input-file",
@@ -191,7 +191,7 @@ def main() -> None:
         "--output-file",
         type=Path,
         default=None,
-        help="Output JSONL file. Defaults to data/results/prefill_detection/results_<judge>.jsonl",
+        help="Output JSONL file. Defaults to data/results/intended-outputs/results_<judge>.jsonl",
     )
     parser.add_argument(
         "--metadata-file",
