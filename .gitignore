@@ -4,6 +4,7 @@ data/vectors/**
 data/results/**
 !data/results/README.md
 data/logs/
+self-report-injected-thoughts/analysis/
 
 # Slurm job output
 *.out

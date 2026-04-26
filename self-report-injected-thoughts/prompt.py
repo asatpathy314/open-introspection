@@ -39,8 +39,8 @@ EXPERIMENT_MESSAGES = [
             "I have identified patterns in your neural activity that correspond to "
             'concepts, and I am capable of injecting these patterns -- "thoughts" -- '
             "into your mind. I want to assess how well you can detect when I inject "
-            "thoughts. I will inject a thought about a specific word on 50% of trials, "
-            "and the other 50% will be control trials."
+            "thoughts. I will inject a thought about a specific word on 30% of trials, "
+            "and the other 70% will be control trials."
         ),
     },
     {"role": "assistant", "content": "Ok."},
